@@ -57,9 +57,9 @@ static void print_help(void) {
     Serial.println(F("bl clear        - clear all"));
     Serial.println(F("bl stats        - counts only"));
     Serial.println(F("wifi            - WiFi+MQTT status"));
-    Serial.println(F("wifi on [s p]   - connect (use NVS or args)"));
+    Serial.println(F("wifi on [s p]   - connect (NVS or args; SSID 공백 가능)"));
     Serial.println(F("wifi off        - disconnect"));
-    Serial.println(F("wifi set <s> <p>- save credentials to NVS"));
+    Serial.println(F("wifi set <s> <p>- save creds (SSID 공백 가능, pass=마지막 단어)"));
     Serial.println(F("wifi stat       - stats only"));
     Serial.println(F("help            - this help"));
     Serial.println(F("=======================\r\n"));
@@ -142,15 +142,16 @@ static void handle_wifi_command(char* args) {
             return;
         }
         if (arg && *arg) {
-            // wifi on <ssid> <pass>
-            char* ssid = arg;
-            char* pass = strchr(arg, ' ');
+            // wifi on <ssid> <pass> - SSID에 공백 가능 (마지막 공백으로 분할)
+            // 예: wifi on My Home WiFi mypass123
+            //     → ssid="My Home WiFi", pass="mypass123"
+            char* pass = strrchr(arg, ' ');
             if (pass) { *pass++ = 0; }
             if (!pass || !*pass) {
-                LOGE("usage: wifi on <ssid> <pass>");
+                LOGE("usage: wifi on <ssid> <pass>  (SSID 공백 가능, pass는 마지막 단어)");
                 return;
             }
-            wifi_bridge_begin_connection(ssid, pass);
+            wifi_bridge_begin_connection(arg, pass);
         } else {
             // NVS 또는 컴파일 타임 매크로에서 조회
             wifi_bridge_begin_connection(nullptr, nullptr);
@@ -160,15 +161,16 @@ static void handle_wifi_command(char* args) {
     } else if (strcmp(cmd, "stat") == 0) {
         wifi_bridge_debug_dump();
     } else if (strcmp(cmd, "set") == 0 && arg) {
-        // wifi set <ssid> <pass>
-        char* ssid = arg;
-        char* pass = strchr(arg, ' ');
+        // wifi set <ssid> <pass> - SSID에 공백 가능 (마지막 공백으로 분할)
+        // 예: wifi set My Home WiFi mypass123
+        //     → ssid="My Home WiFi", pass="mypass123" (NVS에 저장)
+        char* pass = strrchr(arg, ' ');
         if (pass) { *pass++ = 0; }
         if (!pass || !*pass) {
-            LOGE("usage: wifi set <ssid> <pass>");
+            LOGE("usage: wifi set <ssid> <pass>  (SSID 공백 가능, pass는 마지막 단어)");
             return;
         }
-        wifi_bridge_save_credentials(ssid, pass);
+        wifi_bridge_save_credentials(arg, pass);
     } else if (strcmp(cmd, "broker") == 0 && arg) {
         extern void wifi_bridge_set_broker(const char* host);
         // 선언 안 했으므로 inline으로는 안 됨. 직접 구조 변경 필요.
