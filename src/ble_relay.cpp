@@ -35,6 +35,7 @@ public:
     // NimBLE 1.4.2: onConnect/onDisconnect 단일 인자 (ble_gap_conn_desc* 옵션)
     void onConnect(NimBLEServer* server) override {
         _r->_incoming_count++;
+        _r->_last_connect_ms = millis();   // store-and-forward flush 2초 지연용
         LOGI("client connected, in=%d out=%d",
              _r->_incoming_count, _r->_outgoing_count);
     }
@@ -154,6 +155,7 @@ BitchatRelay::BitchatRelay()
       _char(nullptr), _advertising(nullptr),
       _scan(nullptr), _pkt_queue(nullptr), _scan_active(false),
       _incoming_count(0), _outgoing_count(0),
+      _last_connect_ms(0),
       _peer_slot_count(0), _dedup_idx(0) {
     memset(_peers, 0, sizeof(_peers));
     memset(_dedup, 0, sizeof(_dedup));
@@ -271,10 +273,12 @@ void BitchatRelay::loop() {
     }
 
     // Store-and-forward: 클라이언트 접속 시 캐시된 메시지 전송
+    // 연결 후 2초 대기 → subscribe 완료 후 flush (데이터 유실 방지)
     static uint32_t last_flush_check = 0;
     if (millis() - last_flush_check > 500) {
         last_flush_check = millis();
-        if (_incoming_count > 0 && _char && msg_cache_count() > 0) {
+        if (_incoming_count > 0 && _char && msg_cache_count() > 0 &&
+            (millis() - _last_connect_ms > 2000)) {
             LOGI("store-and-forward: flushing %u cached messages", (unsigned)msg_cache_count());
             static NimBLECharacteristic* s_flush_char = nullptr;
             s_flush_char = _char;
