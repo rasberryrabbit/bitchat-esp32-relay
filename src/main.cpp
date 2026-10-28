@@ -23,6 +23,7 @@
 #include "blacklist.h"
 #include "lora_relay.h"
 #include "wifi_bridge.h"
+#include "peer_keys.h"   // senderID → Ed25519 pk 매핑 (서명 검증용)
 #include "packet_splitter.h"   // 큰 패킷 분할/재조립 - LoRa 메시 전용
 
 bitchat_storage_t g_storage;   // extern-able for wifi_bridge.cpp
@@ -325,6 +326,9 @@ void loop() {
              (unsigned)blacklist_get_pk_count(),
              (unsigned)blacklist_get_ble_count(),
              blacklist_is_enabled());
+        // peer_keys 매핑 (서명 검증용)
+        LOGI("--- peer_keys: %u mappings ---",
+             (unsigned)peer_keys_count());
         // LoRa 모듈 상태 (감지된 경우)
         if (lora_relay_is_detected()) {
             lora_relay_debug_dump();

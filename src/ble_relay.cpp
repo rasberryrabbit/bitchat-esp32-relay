@@ -17,6 +17,7 @@
 #include "blacklist.h"
 #include "lora_relay.h"
 #include "wifi_bridge.h"
+#include "peer_keys.h"   // senderID → Ed25519 pk 매핑
 
 #include <cstring>
 #include <algorithm>
@@ -166,6 +167,7 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
 
     retry_init();
     blacklist_init();
+    peer_keys_init();   // senderID → Ed25519 pk 매핑 로드 (서명 검증용)
 
     _pkt_queue = xQueueCreate(BC_PKT_QUEUE_LEN, sizeof(bitchat_pkt_event_t));
     if (!_pkt_queue) {
@@ -291,12 +293,61 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
     // bitchat 프로토콜에 ACK 메커니즘 없음 - passive/explicit ACK 처리 제거
     // relay는 패킷을 받으면 그대로 forward만 함
 
-    // 서명 검증 (실제 bitchat 프로토콜): 일단 스킵 - senderID가 8B이므로
-    // pk 매핑이 필요함. relay는 forward만 하므로 검증은 클라이언트 측에서.
-    // TODO: storage에 senderID → Ed25519 pk 매핑 추가 후 검증 활성화
+    // ===== 서명 검증 + ANNOUNCE pk 추출 =====
     char id[BITCHAT_ID_STR_LEN];
     bitchat_id_from_pk(v.sender_id, id);
     LOGI("received packet from sender=%s type=0x%02x", id, v.type);
+
+    // ANNOUNCE(0x01) 처리: payload에서 32B Ed25519 공개키 추출 → 매핑 저장
+    if (v.type == BITCHAT_MSG_ANNOUNCE && v.payload && v.payload_len >= 10) {
+        // ANNOUNCE payload는 TLV 포맷:
+        //   [01 05 "nickname"] [02 20 <32B signing pk>] [03 20 <32B noise pk>] ...
+        // type=0x02, length=0x20(32)인 필드를 찾아 32B pk 추출
+        size_t off = 0;
+        while (off + 2 <= v.payload_len) {
+            uint8_t ftype = v.payload[off];
+            uint8_t flen  = v.payload[off + 1];
+            if (off + 2 + flen > v.payload_len) break;
+            if (ftype == 0x02 && flen == 32) {
+                // 32B Ed25519 signing public key 발견
+                uint8_t pk[32];
+                memcpy(pk, v.payload + off + 2, 32);
+                peer_keys_add(v.sender_id, pk);
+                LOGI("ANNOUNCE: extracted Ed25519 pk for senderID=%s "
+                     "(pk=%02x%02x%02x%02x...)",
+                     id, pk[0], pk[1], pk[2], pk[3]);
+                break;
+            }
+            off += 2 + flen;
+        }
+    }
+
+    // 서명 검증 (HAS_SIGNATURE flag가 설정된 경우)
+    if (v.signature) {
+        uint8_t pk[32];
+        if (peer_keys_get(v.sender_id, pk)) {
+            // 서명 메시지 계산: TTL=0, signature 제외
+            uint8_t sign_msg[BITCHAT_MAX_PKT_LEN];
+            size_t sign_msg_len = bitchat_compute_signing_message(
+                evt->data, evt->len, &v, sign_msg, sizeof(sign_msg));
+            if (sign_msg_len > 0) {
+                if (crypto_verify_signature(pk, 32,
+                                            sign_msg, sign_msg_len,
+                                            v.signature, 64)) {
+                    LOGI("✓ signature verified from %s", id);
+                } else {
+                    LOGW("✗ signature FAILED from %s, dropping", id);
+                    return;   // 위변조 패킷 차단
+                }
+            } else {
+                LOGW("signing message computation failed for %s", id);
+            }
+        } else {
+            // 매핑 없음 - 아직 ANNOUNCE 안 받았거나 새 피어
+            // 일단 forward (나중에 ANNOUNCE 오면 매핑 생성됨)
+            LOGD("no pk mapping for senderID=%s, forwarding unverified", id);
+        }
+    }
 
     if (check_dedup(v.sender_id, v.timestamp)) {
         LOGD("duplicate packet, dropping");

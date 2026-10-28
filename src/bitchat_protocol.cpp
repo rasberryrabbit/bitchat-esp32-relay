@@ -184,6 +184,37 @@ void bitchat_id_from_sender(const uint8_t* sender_id, char* out_id) {
     out_id[16] = 0;
 }
 
+// 서명 검증용 메시지 계산
+// BinaryProtocol.kt의 toBinaryDataForSigning() 포팅:
+//   - signature 필드 제외 (HAS_SIGNATURE flag 클리어)
+//   - TTL = 0 으로 설정
+//   - 원본 버퍼의 wire bytes 그대로 사용 (압축/padding 보존)
+size_t bitchat_compute_signing_message(const uint8_t* pkt, size_t pkt_len,
+                                         const bitchat_packet_view_t* v,
+                                         uint8_t* out, size_t out_max) {
+    if (!pkt || !v || !out) return 0;
+
+    // signing message = signature를 제외한 모든 바이트
+    size_t sig_offset = v->total_len;
+    if (v->signature) {
+        sig_offset -= BITCHAT_SIG_LEN;   // 64 bytes
+    }
+    if (sig_offset == 0 || sig_offset > pkt_len || sig_offset > out_max) {
+        return 0;
+    }
+
+    // 원본에서 signature 전까지 복사
+    memcpy(out, pkt, sig_offset);
+
+    // TTL = 0 (byte offset 2)
+    out[2] = 0;
+
+    // HAS_SIGNATURE flag 클리어 (byte offset 11, bit 1 = 0x02)
+    out[11] &= ~0x02;
+
+    return sig_offset;
+}
+
 const char* bitchat_type_name(uint8_t type) {
     switch (type) {
         case BITCHAT_MSG_ANNOUNCE:         return "ANNOUNCE";

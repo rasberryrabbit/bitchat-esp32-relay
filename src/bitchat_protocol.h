@@ -148,6 +148,15 @@ size_t bitchat_decrement_ttl(const uint8_t* src, size_t src_len,
 // 8바이트 senderID를 hex 문자열로 (16 chars + NUL)
 void bitchat_id_from_sender(const uint8_t* sender_id, char* out_id);
 
+// 서명 검증용 메시지 계산 (BinaryProtocol.kt toBinaryDataForSigning() 포팅)
+// 원본 패킷에서 signature를 제외한 바이트를 복사하고:
+//   - TTL = 0 으로 설정 (TTL 변경해도 서명 유효)
+//   - HAS_SIGNATURE flag bit 클리어 (signature 없는 형태로)
+// 반환: signing message 길이, 0이면 실패
+size_t bitchat_compute_signing_message(const uint8_t* pkt, size_t pkt_len,
+                                         const bitchat_packet_view_t* v,
+                                         uint8_t* out, size_t out_max);
+
 // 하위 호환 alias (기존 bitchat_id_from_pk 호출 유지)
 #define bitchat_id_from_pk(sender_id, out_id) bitchat_id_from_sender(sender_id, out_id)
 
