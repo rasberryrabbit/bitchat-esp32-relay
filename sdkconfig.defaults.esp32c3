@@ -1,0 +1,72 @@
+# sdkconfig.defaults.esp32c3 - ESP32-C3 전용 설정 오버라이드
+#
+# 이 파일은 `idf.py set-target esp32c3` 실행 시 sdkconfig.defaults와
+# 함께 병합됨.
+#
+# C3의 특이점:
+#   - RISC-V 싱글코어 (FreeRTOS 핀닝 무관)
+#   - SRAM 400KB (ESP32 클래식 520KB 보다 적음 - 메모리 frugal 필요)
+#   - BLE 5.0 + WiFi 4 (코어 스텍은 동일하지만 설정값이 다름)
+#   - 기본 BLE 스텍은 NimBLE (더 적은 메모리)이지만,
+#     Arduino BLE 라이브러리 호환을 위해 Bluedroid 강제 사용
+
+# ---- CPU/클럭 ----
+CONFIG_ESP32C3_DEFAULT_CPU_FREQ_160=y
+CONFIG_ESP32C3_DEFAULT_CPU_FREQ_MHZ=160
+
+# ---- BLE - NimBLE (Bluedroid 비활성) ----
+# C3에서 Bluedroid 끄면 약 60KB RAM 절약 → 동시 연결 4 → 8 가능
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=n
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BTDM_CONTROLLER_MODE_BTDM=y
+# NimBLE-Arduino가 BLE 컨트롤러에 직접 접근하므로 동시 연결 한계는
+# NimBLE config (CONFIG_BT_NIMBLE_MAX_CONNECTIONS)에서 설정.
+
+# ---- NVS Flash ----
+CONFIG_NVS_FLASH_ENABLED=y
+
+# ---- FreeRTOS ----
+CONFIG_FREERTOS_HZ=1000
+# C3는 단일 코어이므로 multicore 핀닝 비활성
+CONFIG_FREERTOS_UNICORE=y
+
+# ---- 로깅 레벨 ----
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# ---- mbedtls - Ed25519 활성화 ----
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_EDDSA_C=y
+CONFIG_MBEDTLS_SHA512_C=y
+CONFIG_MBEDTLS_ENTROPY_C=y
+CONFIG_MBEDTLS_CTR_DRBG_C=y
+
+# ---- WiFi (향후 WiFi 브릿지 확장시 사용, 현재는 비활성) ----
+CONFIG_ESP_WIFI_ENABLED=y
+
+# ---- Partition Table ----
+CONFIG_PARTITION_TABLE_DEFAULT=y
+
+# ---- Arduino 컴포넌트 ----
+CONFIG_AUTOSTART_ARDUINO=y
+
+# ---- 전원 관리 (배터리+절전 모드) - C3 특화 ----
+# C3는 단일 코어 RISC-V, esp_pm_configure에 다른 config struct 사용
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+CONFIG_PM_POWER_DOWN_CPU=y
+# FreeRTOS tickless idle - CPU 유휴 시 자동 라이트 슬립
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_TICKLESS_IDLE_TIME=1
+CONFIG_FREERTOS_USE_RTC_HWOPTS=y
+CONFIG_UART_ISR_IN_IRAM=y
+
+# ---- 메모리 절약 (C3 특화) ----
+# BT 컨트롤러 메모리 최적화
+CONFIG_BT_CTRL_BLE_DYN_TX_EN=y
+CONFIG_BT_CTRL_BLE_DYN_TX_LEVEL=2
+# 작은 버퍼로 BLE 메모리 사용량 감소
+CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y

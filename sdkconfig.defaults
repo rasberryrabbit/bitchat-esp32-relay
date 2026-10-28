@@ -1,0 +1,56 @@
+# sdkconfig.defaults - ESP-IDF configuration defaults
+#
+# 이 파일은 `idf.py set-target esp32` 후 sdkconfig에 병합됨.
+# 사용자가 sdkconfig를 직접 수정하지 않아도 이 기본값들이 적용됨.
+
+# ---- BLE - NimBLE 사용 (Bluedroid 비활성) ----
+# NimBLE-Arduino 라이브러리가 자체 NimBLE 스텍 포함하므로
+# ESP-IDF Bluedroid는 비활성화하여 메모리 절약
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=n        # ESP-IDF NimBLE 아님 - NimBLE-Arduino 자체 구현 사용
+CONFIG_BT_BLUEDROID_ENABLED=n     # Bluedroid 비활성
+# BT 컨트롤러는 활성 (BLE radio)
+CONFIG_BTDM_CONTROLLER_MODE_BTDM=y
+
+# ---- WiFi (향후 WiFi 브릿지 확장시 사용, 현재는 비활성) ----
+CONFIG_ESP_WIFI_ENABLED=y
+
+# ---- NVS Flash ----
+CONFIG_NVS_FLASH_ENABLED=y
+
+# ---- FreeRTOS ----
+CONFIG_FREERTOS_HZ=1000
+
+# ---- Partition Table ----
+# 4MB 플래시 - 기본 파티션 사용 (NVS 0x6000 = 24KB)
+CONFIG_PARTITION_TABLE_DEFAULT=y
+
+# ---- 로깅 레벨 ----
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# ---- mbedtls - Ed25519 활성화 ----
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_EDDSA_C=y
+CONFIG_MBEDTLS_SHA512_C=y
+CONFIG_MBEDTLS_ENTROPY_C=y
+CONFIG_MBEDTLS_CTR_DRBG_C=y
+
+# ---- Arduino 컴포넌트 ----
+CONFIG_AUTOSTART_ARDUINO=y
+
+# ---- 전원 관리 (배터리+절전 모드) ----
+# esp_pm_configure()를 통한 자동 라이트 슬립 + DFS
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+CONFIG_PM_POWER_DOWN_CPU=y
+CONFIG_PM_POWER_DOWN_TAG_MEM_OFF=y
+# FreeRTOS tickless idle - CPU 유휴 시 자동 슬립
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_TICKLESS_IDLE_TIME=1
+# RTC 메모리 (딥슬립 간 상태 유지)
+CONFIG_FREERTOS_USE_RTC_HWOPTS=y
+# UART 플러시 안함 (라이트 슬립 간 USB 로그 유실 가능)
+CONFIG_UART_ISR_IN_IRAM=y
