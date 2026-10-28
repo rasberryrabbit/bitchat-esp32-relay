@@ -370,7 +370,7 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
                     if (crypto_verify_signature(pk, 32,
                                                 sign_msg, sign_msg_len,
                                                 v.signature, 64)) {
-                        LOGI("✓ signature verified (key index %d) from %s", ki, id);
+                        LOGI("[OK] signature verified (key index %d) from %s", ki, id);
                         verified = true;
                     } else {
                         LOGD("signature check with key %d failed", ki);
@@ -378,7 +378,7 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
                 }
             }
             if (!verified) {
-                LOGW("⚠ signature failed with all keys from %s (forwarding anyway)", id);
+                LOGW("[!] signature failed with all keys from %s (forwarding anyway)", id);
             }
         }
     }

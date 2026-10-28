@@ -5,9 +5,9 @@
  *   16개 재조립 슬롯 관리. 각 슬롯은 BITCHAT_MAX_PKT_LEN 버퍼 + 비트맵 + 타임스탬프.
  *   sender_pk[0..7] XOR counter[0..7] = 8B hash로 슬롯 식별.
  *
- *   송신 측: 원본 패킷을 208B 청크로 분할 → magic 0xCF 헤더 붙여 송신
- *   수신 측: 청크 hash로 슬롯 찾기 → 비트맵에 청크 인덱스 기록
- *           → 모든 비트 1이면 원본 패킷 재조립 후 out_packet에 복사
+ *   송신 측: 원본 패킷을 208B 청크로 분할 -> magic 0xCF 헤더 붙여 송신
+ *   수신 측: 청크 hash로 슬롯 찾기 -> 비트맵에 청크 인덱스 기록
+ *           -> 모든 비트 1이면 원본 패킷 재조립 후 out_packet에 복사
  */
 
 #include "packet_splitter.h"
@@ -221,7 +221,7 @@ bool splitter_receive_chunk(const uint8_t* chunk, size_t chunk_len,
         }
         slot->active = false;
         g_total_reassembled++;
-        LOGI("splitter: ✓ reassembled %u chunks → %u bytes (hash=0x%02x%02x%02x%02x)",
+        LOGI("splitter: [OK] reassembled %u chunks -> %u bytes (hash=0x%02x%02x%02x%02x)",
              num_chunks, (unsigned)original_len,
              hash[0], hash[1], hash[2], hash[3]);
         return true;

@@ -57,9 +57,9 @@ static void print_help(void) {
     Serial.println(F("bl clear        - clear all"));
     Serial.println(F("bl stats        - counts only"));
     Serial.println(F("wifi            - WiFi+MQTT status"));
-    Serial.println(F("wifi on [s p]   - connect (NVS or args; SSID 공백 가능)"));
+    Serial.println(F("wifi on [s p]   - connect (NVS or args; SSID spaces OK)"));
     Serial.println(F("wifi off        - disconnect"));
-    Serial.println(F("wifi set <s> <p>- save creds (SSID 공백 가능, pass=마지막 단어)"));
+    Serial.println(F("wifi set <s> <p>- save creds (SSID spaces OK, pass=last word)"));
     Serial.println(F("wifi stat       - stats only"));
     Serial.println(F("help            - this help"));
     Serial.println(F("=======================\r\n"));
@@ -148,7 +148,7 @@ static void handle_wifi_command(char* args) {
             char* pass = strrchr(arg, ' ');
             if (pass) { *pass++ = 0; }
             if (!pass || !*pass) {
-                LOGE("usage: wifi on <ssid> <pass>  (SSID 공백 가능, pass는 마지막 단어)");
+                LOGE("usage: wifi on <ssid> <pass>  (SSID spaces OK, pass=last word)");
                 return;
             }
             wifi_bridge_begin_connection(arg, pass);
@@ -167,7 +167,7 @@ static void handle_wifi_command(char* args) {
         char* pass = strrchr(arg, ' ');
         if (pass) { *pass++ = 0; }
         if (!pass || !*pass) {
-            LOGE("usage: wifi set <ssid> <pass>  (SSID 공백 가능, pass는 마지막 단어)");
+            LOGE("usage: wifi set <ssid> <pass>  (SSID spaces OK, pass=last word)");
             return;
         }
         wifi_bridge_save_credentials(arg, pass);

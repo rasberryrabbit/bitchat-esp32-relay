@@ -232,13 +232,13 @@ size_t bitchat_compute_signing_message(const uint8_t* pkt, size_t pkt_len,
         int paddingNeeded = targetSize - (int)sig_offset;
         if (paddingNeeded > 0 && paddingNeeded <= 255) {
             memset(out + sig_offset, paddingNeeded, paddingNeeded);
-            LOGD("signing message: %u bytes + %u bytes PKCS#7 padding → %u total",
+            LOGD("signing message: %u bytes + %u bytes PKCS#7 padding -> %u total",
                  (unsigned)sig_offset, paddingNeeded, targetSize);
             return targetSize;
         }
     }
 
-    // 패딩 불가 (너무 크거나 버퍼 부족) → 패딩 없이 반환
+    // 패딩 불가 (너무 크거나 버퍼 부족) -> 패딩 없이 반환
     LOGD("signing message: %u bytes (no padding)", (unsigned)sig_offset);
     return sig_offset;
 }

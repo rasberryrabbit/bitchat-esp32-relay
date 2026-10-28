@@ -2,9 +2,9 @@
  * wifi_bridge.cpp - WiFi + MQTT 브릿지 구현
  *
  * 한국어:
- *   WiFi STA 모드로 AP 연결 → MQTT 브로커 연결
- *   - BLE 패킷 → base64 인코딩 → MQTT publish (bchat/tx topic)
- *   - MQTT subscribe (bchat/rx/{node_id}) → base64 디코딩 → BLE 큐로 enqueue
+ *   WiFi STA 모드로 AP 연결 -> MQTT 브로커 연결
+ *   - BLE 패킷 -> base64 인코딩 -> MQTT publish (bchat/tx topic)
+ *   - MQTT subscribe (bchat/rx/{node_id}) -> base64 디코딩 -> BLE 큐로 enqueue
  *
  *   Serial 명령으로 실시간 on/off:
  *     wifi                  - 상태 출력
@@ -120,7 +120,7 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     g_packets_rx++;
     // BLE 큐에 enqueue (LoRa와 동일한 출처 marker 0xFFFC 사용)
     g_relay.enqueue_packet(decoded, decoded_len, BC_SRC_CLIENT_NOTIFY, 0xFFFC);
-    LOGD("mqtt→BLE: enqueued %u bytes", (unsigned)decoded_len);
+    LOGD("mqtt->BLE: enqueued %u bytes", (unsigned)decoded_len);
 }
 
 bool wifi_bridge_init(void) {

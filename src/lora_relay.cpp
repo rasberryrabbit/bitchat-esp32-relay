@@ -12,8 +12,8 @@
  *   인식 알고리즘:
  *     1) SPI init (sck, miso, mosi)
  *     2) LoRa.setPins(cs, rst, irq)
- *     3) LoRa.begin(freq) → 1이면 OK
- *     4) RegVersion (0x42) 읽기 → 0x12면 SX1276 정상
+ *     3) LoRa.begin(freq) -> 1이면 OK
+ *     4) RegVersion (0x42) 읽기 -> 0x12면 SX1276 정상
  */
 
 #include "lora_relay.h"
@@ -107,7 +107,7 @@ bool lora_relay_begin(uint32_t frequency_hz) {
 
         g_lora_detected = true;
         g_active_pinout = *p;
-        LOGI("lora: ✓ %s detected (SX127%s, version=0x%02x)",
+        LOGI("lora: [OK] %s detected (SX127%s, version=0x%02x)",
              p->name,
              version == SX1276_VERSION_ID ? "6" : "2",
              version);
@@ -160,7 +160,7 @@ bool lora_relay_broadcast(const uint8_t* data, size_t len) {
     if (!g_lora_detected) return false;
     if (!data || len == 0) return false;
 
-    // 큰 패킷 → 분할 송신 (packet_splitter 사용)
+    // 큰 패킷 -> 분할 송신 (packet_splitter 사용)
     if (len > LORA_MAX_FRAME_LEN) {
         LOGD("lora: packet %u > frame %u, splitting",
              (unsigned)len, LORA_MAX_FRAME_LEN);
@@ -168,7 +168,7 @@ bool lora_relay_broadcast(const uint8_t* data, size_t len) {
         if (ok) {
             g_packets_tx++;
             // 각 청크를 단일 TX로 카운트 (분할 전체를 1개 패킷으로)
-            LOGI("lora: split TX complete (%u bytes → chunks)", (unsigned)len);
+            LOGI("lora: split TX complete (%u bytes -> chunks)", (unsigned)len);
         } else {
             g_drops_too_large++;
             LOGW("lora: split TX failed");
@@ -176,7 +176,7 @@ bool lora_relay_broadcast(const uint8_t* data, size_t len) {
         return ok;
     }
 
-    // 작은 패킷 → 그대로 송신
+    // 작은 패킷 -> 그대로 송신
     LoRa.beginPacket();
     LoRa.write(data, len);
     int rc = LoRa.endPacket();
@@ -221,13 +221,13 @@ void lora_relay_handle_receive(int packet_size) {
     LOGD("lora: RX %d bytes rssi=%d snr=%.1f (total=%u)",
          read, rssi, snr, g_packets_rx);
 
-    // 청크(0xCF)인지 먼저 체크 → 재조립
+    // 청크(0xCF)인지 먼저 체크 -> 재조립
     if (splitter_is_chunk(buf, read)) {
         static uint8_t reassembled[BITCHAT_MAX_PKT_LEN];
         size_t reassembled_len = 0;
         if (splitter_receive_chunk(buf, read, reassembled, &reassembled_len)) {
-            // 모든 청크 도착 → 원본 패킷을 BLE 큐로 enqueue
-            LOGI("lora: reassembled packet %u bytes → BLE queue",
+            // 모든 청크 도착 -> 원본 패킷을 BLE 큐로 enqueue
+            LOGI("lora: reassembled packet %u bytes -> BLE queue",
                  (unsigned)reassembled_len);
             g_relay.enqueue_packet(reassembled, reassembled_len,
                                     BC_SRC_CLIENT_NOTIFY, 0xFFFD);
@@ -236,7 +236,7 @@ void lora_relay_handle_receive(int packet_size) {
         return;
     }
 
-    // 일반 bitchat 패킷(0xBC) → 그대로 BLE 큐에 enqueue
+    // 일반 bitchat 패킷(0xBC) -> 그대로 BLE 큐에 enqueue
     g_relay.enqueue_packet(buf, (size_t)read, BC_SRC_CLIENT_NOTIFY, 0xFFFD);
 }
 

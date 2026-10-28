@@ -103,7 +103,7 @@ bool power_init(const power_config_t* cfg) {
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #endif
     if (rc != ESP_OK) {
-        LOGW("esp_pm_configure failed: 0x%04x (계속 진행, 자동 절전 안 됨)", rc);
+        LOGW("esp_pm_configure failed: 0x%04x (continuing without auto power saving)", rc);
     } else {
         LOGI("power: PM configured (light sleep, DFS enabled)");
     }
