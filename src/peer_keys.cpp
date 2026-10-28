@@ -17,7 +17,8 @@
 typedef struct {
     uint8_t  active;
     uint8_t  sender_id[BC_PEER_KEY_ID_SIZE];
-    uint8_t  pk[BC_PEER_KEY_PK_SIZE];
+    uint8_t  pk[2][BC_PEER_KEY_PK_SIZE];  // 2 keys: [0]=primary, [1]=secondary
+    uint8_t  key_mask;                     // bit 0: pk[0] valid, bit 1: pk[1] valid
 } peer_key_entry_t;
 
 static peer_key_entry_t g_entries[BC_PEER_KEY_MAX_ENTRIES];
@@ -54,50 +55,56 @@ bool peer_keys_init(void) {
     return true;
 }
 
-bool peer_keys_add(const uint8_t* sender_id, const uint8_t* pk) {
+bool peer_keys_add_indexed(const uint8_t* sender_id, const uint8_t* pk, int key_index) {
     if (!g_init) peer_keys_init();
-    if (!sender_id || !pk) return false;
+    if (!sender_id || !pk || key_index < 0 || key_index > 1) return false;
 
-    // 기존 매핑 찾기 (갱신)
+    // 기존 매핑 찾기
     for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
         if (g_entries[i].active &&
             memcmp(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE) == 0) {
-            memcpy(g_entries[i].pk, pk, BC_PEER_KEY_PK_SIZE);
+            memcpy(g_entries[i].pk[key_index], pk, BC_PEER_KEY_PK_SIZE);
+            g_entries[i].key_mask |= (1 << key_index);
             persist();
-            char id[17];
-            bitchat_id_from_pk(sender_id, id);
-            LOGD("peer_keys: updated pk for senderID=%s", id);
             return true;
         }
     }
-
-    // 빈 슬롯 찾기
+    // 빈 슬롯
     for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
         if (!g_entries[i].active) {
             g_entries[i].active = 1;
             memcpy(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE);
-            memcpy(g_entries[i].pk, pk, BC_PEER_KEY_PK_SIZE);
+            memcpy(g_entries[i].pk[key_index], pk, BC_PEER_KEY_PK_SIZE);
+            g_entries[i].key_mask = (1 << key_index);
             persist();
-            char id[17];
-            bitchat_id_from_pk(sender_id, id);
-            LOGI("peer_keys: added pk mapping for senderID=%s (slot %d)", id, i);
             return true;
         }
     }
-    LOGW("peer_keys: full, cannot add");
     return false;
 }
 
-bool peer_keys_get(const uint8_t* sender_id, uint8_t* out_pk) {
-    if (!g_init || !sender_id || !out_pk) return false;
+bool peer_keys_get_indexed(const uint8_t* sender_id, int key_index, uint8_t* out_pk) {
+    if (!g_init || !sender_id || !out_pk || key_index < 0 || key_index > 1) return false;
     for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
         if (g_entries[i].active &&
             memcmp(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE) == 0) {
-            memcpy(out_pk, g_entries[i].pk, BC_PEER_KEY_PK_SIZE);
-            return true;
+            if (g_entries[i].key_mask & (1 << key_index)) {
+                memcpy(out_pk, g_entries[i].pk[key_index], BC_PEER_KEY_PK_SIZE);
+                return true;
+            }
         }
     }
     return false;
+}
+
+bool peer_keys_add(const uint8_t* sender_id, const uint8_t* pk) {
+    return peer_keys_add_indexed(sender_id, pk, 0);
+}
+
+bool peer_keys_get(const uint8_t* sender_id, uint8_t* out_pk) {
+    // index 0 먼저 시도, 없으면 index 1
+    if (peer_keys_get_indexed(sender_id, 0, out_pk)) return true;
+    return peer_keys_get_indexed(sender_id, 1, out_pk);
 }
 
 size_t peer_keys_count(void) {

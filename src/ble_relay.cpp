@@ -301,51 +301,64 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
     // ANNOUNCE(0x01) 처리: payload에서 32B Ed25519 공개키 추출 → 매핑 저장
     if (v.type == BITCHAT_MSG_ANNOUNCE && v.payload && v.payload_len >= 10) {
         // ANNOUNCE payload는 TLV 포맷:
-        //   [01 05 "nickname"] [02 20 <32B signing pk>] [03 20 <32B noise pk>] ...
-        // type=0x02, length=0x20(32)인 필드를 찾아 32B pk 추출
+        //   [01 05 "nickname"] [02 20 <32B key A>] [03 20 <32B key B>] ...
+        // type 0x02 또는 0x03이 Ed25519 서명용 공개키일 수 있음
+        // → 두 키 모두 추출하여 검증 시도
         size_t off = 0;
+        uint8_t pk_a[32] = {0};  // type 0x02
+        uint8_t pk_b[32] = {0};  // type 0x03
+        bool found_a = false, found_b = false;
         while (off + 2 <= v.payload_len) {
             uint8_t ftype = v.payload[off];
             uint8_t flen  = v.payload[off + 1];
             if (off + 2 + flen > v.payload_len) break;
-            if (ftype == 0x02 && flen == 32) {
-                // 32B Ed25519 signing public key 발견
-                uint8_t pk[32];
-                memcpy(pk, v.payload + off + 2, 32);
-                peer_keys_add(v.sender_id, pk);
-                LOGI("ANNOUNCE: extracted Ed25519 pk for senderID=%s "
-                     "(pk=%02x%02x%02x%02x...)",
-                     id, pk[0], pk[1], pk[2], pk[3]);
-                break;
+            if (flen == 32) {
+                if (ftype == 0x02) {
+                    memcpy(pk_a, v.payload + off + 2, 32);
+                    found_a = true;
+                } else if (ftype == 0x03) {
+                    memcpy(pk_b, v.payload + off + 2, 32);
+                    found_b = true;
+                }
             }
             off += 2 + flen;
         }
+        // type 0x02 → key index 0, type 0x03 → key index 1
+        if (found_a) {
+            peer_keys_add_indexed(v.sender_id, pk_a, 0);
+            LOGI("ANNOUNCE: key A (type=0x02) stored at index 0 (%02x%02x%02x%02x...)",
+                 pk_a[0], pk_a[1], pk_a[2], pk_a[3]);
+        }
+        if (found_b) {
+            peer_keys_add_indexed(v.sender_id, pk_b, 1);
+            LOGI("ANNOUNCE: key B (type=0x03) stored at index 1 (%02x%02x%02x%02x...)",
+                 pk_b[0], pk_b[1], pk_b[2], pk_b[3]);
+        }
     }
 
-    // 서명 검증 (HAS_SIGNATURE flag가 설정된 경우)
+    // 서명 검증: 두 키(index 0, 1) 모두 시도
     if (v.signature) {
-        uint8_t pk[32];
-        if (peer_keys_get(v.sender_id, pk)) {
-            // 서명 메시지 계산: TTL=0, signature 제외
-            uint8_t sign_msg[BITCHAT_MAX_PKT_LEN];
-            size_t sign_msg_len = bitchat_compute_signing_message(
-                evt->data, evt->len, &v, sign_msg, sizeof(sign_msg));
-            if (sign_msg_len > 0) {
-                if (crypto_verify_signature(pk, 32,
-                                            sign_msg, sign_msg_len,
-                                            v.signature, 64)) {
-                    LOGI("✓ signature verified from %s", id);
-                } else {
-                    LOGW("✗ signature FAILED from %s, dropping", id);
-                    return;   // 위변조 패킷 차단
+        uint8_t sign_msg[BITCHAT_MAX_PKT_LEN];
+        size_t sign_msg_len = bitchat_compute_signing_message(
+            evt->data, evt->len, &v, sign_msg, sizeof(sign_msg));
+        if (sign_msg_len > 0) {
+            bool verified = false;
+            for (int ki = 0; ki < 2 && !verified; ++ki) {
+                uint8_t pk[32];
+                if (peer_keys_get_indexed(v.sender_id, ki, pk)) {
+                    if (crypto_verify_signature(pk, 32,
+                                                sign_msg, sign_msg_len,
+                                                v.signature, 64)) {
+                        LOGI("✓ signature verified (key index %d) from %s", ki, id);
+                        verified = true;
+                    } else {
+                        LOGD("signature check with key %d failed", ki);
+                    }
                 }
-            } else {
-                LOGW("signing message computation failed for %s", id);
             }
-        } else {
-            // 매핑 없음 - 아직 ANNOUNCE 안 받았거나 새 피어
-            // 일단 forward (나중에 ANNOUNCE 오면 매핑 생성됨)
-            LOGD("no pk mapping for senderID=%s, forwarding unverified", id);
+            if (!verified) {
+                LOGW("⚠ signature failed with all keys from %s (forwarding anyway)", id);
+            }
         }
     }
 

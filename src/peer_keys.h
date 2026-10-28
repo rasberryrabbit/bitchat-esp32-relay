@@ -25,6 +25,13 @@ extern "C" {
 #define BC_PEER_KEY_ID_SIZE       8
 #define BC_PEER_KEY_PK_SIZE       32
 
+// 매핑 추가 (key_index: 0=primary, 1=secondary)
+// 두 키를 시도해야 하므로 인덱스 지정 가능
+bool peer_keys_add_indexed(const uint8_t* sender_id, const uint8_t* pk, int key_index);
+
+// 매핑 조회 (key_index: 0 또는 1)
+bool peer_keys_get_indexed(const uint8_t* sender_id, int key_index, uint8_t* out_pk);
+
 // 초기화
 bool peer_keys_init(void);
 

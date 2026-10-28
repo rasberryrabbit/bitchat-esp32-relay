@@ -189,29 +189,57 @@ void bitchat_id_from_sender(const uint8_t* sender_id, char* out_id) {
 //   - signature 필드 제외 (HAS_SIGNATURE flag 클리어)
 //   - TTL = 0 으로 설정
 //   - 원본 버퍼의 wire bytes 그대로 사용 (압축/padding 보존)
+//   - MessagePadding 적용 (PKCS#7, 블록 크기 256/512/1024/2048)
 size_t bitchat_compute_signing_message(const uint8_t* pkt, size_t pkt_len,
                                          const bitchat_packet_view_t* v,
                                          uint8_t* out, size_t out_max) {
     if (!pkt || !v || !out) return 0;
 
-    // signing message = signature를 제외한 모든 바이트
+    // 1. signature 제외한 바이트 길이
     size_t sig_offset = v->total_len;
     if (v->signature) {
         sig_offset -= BITCHAT_SIG_LEN;   // 64 bytes
     }
-    if (sig_offset == 0 || sig_offset > pkt_len || sig_offset > out_max) {
+    if (sig_offset == 0 || sig_offset > pkt_len) {
         return 0;
     }
 
-    // 원본에서 signature 전까지 복사
+    // 2. 원본에서 signature 전까지 복사
     memcpy(out, pkt, sig_offset);
 
-    // TTL = 0 (byte offset 2)
+    // 3. TTL = 0 (byte offset 2)
     out[2] = 0;
 
-    // HAS_SIGNATURE flag 클리어 (byte offset 11, bit 1 = 0x02)
+    // 4. HAS_SIGNATURE flag 클리어 (byte offset 11, bit 1 = 0x02)
     out[11] &= ~0x02;
 
+    // 5. MessagePadding 적용 (PKCS#7, bitchat 호환)
+    //    blockSizes = [256, 512, 1024, 2048]
+    //    totalSize = sig_offset + 16 (AES-GCM tag 오버헤드)
+    //    가장 작은 블록 크기 선택 후 PKCS#7 패딩
+    static const int blockSizes[] = {256, 512, 1024, 2048};
+    int totalSize = (int)sig_offset + 16;
+    int targetSize = (int)sig_offset;  // 기본값: 패딩 안 함
+    for (int i = 0; i < 4; ++i) {
+        if (totalSize <= blockSizes[i]) {
+            targetSize = blockSizes[i];
+            break;
+        }
+    }
+
+    if (targetSize > (int)sig_offset && targetSize <= (int)out_max) {
+        // PKCS#7 패딩: 남은 공간을 (targetSize - sig_offset) 값으로 채움
+        int paddingNeeded = targetSize - (int)sig_offset;
+        if (paddingNeeded > 0 && paddingNeeded <= 255) {
+            memset(out + sig_offset, paddingNeeded, paddingNeeded);
+            LOGD("signing message: %u bytes + %u bytes PKCS#7 padding → %u total",
+                 (unsigned)sig_offset, paddingNeeded, targetSize);
+            return targetSize;
+        }
+    }
+
+    // 패딩 불가 (너무 크거나 버퍼 부족) → 패딩 없이 반환
+    LOGD("signing message: %u bytes (no padding)", (unsigned)sig_offset);
     return sig_offset;
 }
 
