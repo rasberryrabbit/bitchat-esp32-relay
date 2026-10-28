@@ -18,6 +18,7 @@
 #include "lora_relay.h"
 #include "wifi_bridge.h"
 #include "peer_keys.h"   // senderID → Ed25519 pk 매핑
+#include "msg_cache.h"    // store-and-forward 메시지 캐시
 
 #include <cstring>
 #include <algorithm>
@@ -168,6 +169,7 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     retry_init();
     blacklist_init();
     peer_keys_init();   // senderID → Ed25519 pk 매핑 로드 (서명 검증용)
+    msg_cache_init();   // store-and-forward 캐시 초기화
 
     _pkt_queue = xQueueCreate(BC_PKT_QUEUE_LEN, sizeof(bitchat_pkt_event_t));
     if (!_pkt_queue) {
@@ -266,6 +268,21 @@ void BitchatRelay::loop() {
         last_maint = millis();
         maintain_connections();
         scan_cycle();
+    }
+
+    // Store-and-forward: 클라이언트 접속 시 캐시된 메시지 전송
+    static uint32_t last_flush_check = 0;
+    if (millis() - last_flush_check > 500) {
+        last_flush_check = millis();
+        if (_incoming_count > 0 && _char && msg_cache_count() > 0) {
+            LOGI("store-and-forward: flushing %u cached messages", (unsigned)msg_cache_count());
+            static NimBLECharacteristic* s_flush_char = nullptr;
+            s_flush_char = _char;
+            msg_cache_flush([](const uint8_t* d, size_t l) {
+                if (s_flush_char) { s_flush_char->setValue(d, l); s_flush_char->notify(); }
+            });
+            s_flush_char = nullptr;
+        }
     }
 }
 
@@ -435,12 +452,17 @@ void BitchatRelay::forward_to_others(const uint8_t* data, size_t len,
         wifi_bridge_publish(data, len);
     }
 
-    // 1) 모든 incoming clients에게 notify (NimBLE notify(data, len) 한 번에)
+    // 1) 모든 incoming clients에게 notify
     if (_char) {
         _char->setValue(data, len);
         _char->notify();
-        LOGD("forwarded to %d subscribed clients via notify",
-             _incoming_count);
+    }
+    // Store-and-forward: 연결된 클라이언트가 없으면 MESSAGE 캐시에 저장
+    if (_incoming_count == 0) {
+        bitchat_packet_view_t cv;
+        if (bitchat_parse(data, len, &cv) && cv.type == BITCHAT_MSG_MESSAGE) {
+            msg_cache_add(data, len);
+        }
     }
 
     // 2) outgoing peers의 RX char에 write

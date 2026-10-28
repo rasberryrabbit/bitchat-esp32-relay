@@ -25,6 +25,7 @@
 #include "wifi_bridge.h"
 #include "peer_keys.h"   // senderID → Ed25519 pk 매핑 (서명 검증용)
 #include "packet_splitter.h"   // 큰 패킷 분할/재조립 - LoRa 메시 전용
+#include "msg_cache.h"          // store-and-forward 메시지 캐시
 
 bitchat_storage_t g_storage;   // extern-able for wifi_bridge.cpp
 static power_config_t   g_power;
@@ -298,6 +299,7 @@ void loop() {
     if (millis() - last_splitter_cleanup > 1000) {
         last_splitter_cleanup = millis();
         splitter_cleanup_timeouts();
+        msg_cache_cleanup();   // 12시간 경과 캐시 항목 제거
     }
 
     // 전원 관리 - 유휴 시 라이트 슬립 + 상태 LED + 배터리 모니터링
@@ -329,6 +331,9 @@ void loop() {
         // peer_keys 매핑 (서명 검증용)
         LOGI("--- peer_keys: %u mappings ---",
              (unsigned)peer_keys_count());
+        // store-and-forward 캐시
+        LOGI("--- msg_cache: %u cached ---",
+             (unsigned)msg_cache_count());
         // LoRa 모듈 상태 (감지된 경우)
         if (lora_relay_is_detected()) {
             lora_relay_debug_dump();
