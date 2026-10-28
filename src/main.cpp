@@ -22,8 +22,9 @@
 #include "retry_queue.h"
 #include "blacklist.h"
 #include "lora_relay.h"
+#include "wifi_bridge.h"
 
-static bitchat_storage_t g_storage;
+bitchat_storage_t g_storage;   // extern-able for wifi_bridge.cpp
 static power_config_t   g_power;
 static uint32_t g_last_status_ms = 0;
 
@@ -52,6 +53,11 @@ static void print_help(void) {
     Serial.println(F("bl rm <hex>      - remove"));
     Serial.println(F("bl clear        - clear all"));
     Serial.println(F("bl stats        - counts only"));
+    Serial.println(F("wifi            - WiFi+MQTT status"));
+    Serial.println(F("wifi on [s p]   - connect (use NVS or args)"));
+    Serial.println(F("wifi off        - disconnect"));
+    Serial.println(F("wifi set <s> <p>- save credentials to NVS"));
+    Serial.println(F("wifi stat       - stats only"));
     Serial.println(F("help            - this help"));
     Serial.println(F("=======================\r\n"));
 }
@@ -105,6 +111,70 @@ static void handle_blacklist_command(char* args) {
     }
 }
 
+// ============================================================
+// WiFi bridge Serial 명령 처리
+//
+// 지원 명령:
+//   wifi                  - 현재 상태 출력
+//   wifi on               - WiFi+MQTT 연결 시도 (NVS 또는 컴파일 타임 값 사용)
+//   wifi on <ssid> <pass> - 지정한 SSID/비번으로 연결
+//   wifi off              - 연결 해제
+//   wifi stat             - 통계만 출력
+//   wifi set <ssid> <pass>- NVS에 영속 저장 (재부팅 후 'wifi on'에서 자동 사용)
+//   wifi broker <host>    - MQTT broker 호스트 변경 (RAM만, 기본 test.mosquitto.org)
+//
+// ============================================================
+static void handle_wifi_command(char* args) {
+    if (!args || *args == 0) {
+        wifi_bridge_debug_dump();
+        return;
+    }
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "on") == 0) {
+        if (wifi_bridge_is_connected()) {
+            LOGW("wifi already connected, use 'wifi off' first");
+            return;
+        }
+        if (arg && *arg) {
+            // wifi on <ssid> <pass>
+            char* ssid = arg;
+            char* pass = strchr(arg, ' ');
+            if (pass) { *pass++ = 0; }
+            if (!pass || !*pass) {
+                LOGE("usage: wifi on <ssid> <pass>");
+                return;
+            }
+            wifi_bridge_begin_connection(ssid, pass);
+        } else {
+            // NVS 또는 컴파일 타임 매크로에서 조회
+            wifi_bridge_begin_connection(nullptr, nullptr);
+        }
+    } else if (strcmp(cmd, "off") == 0) {
+        wifi_bridge_disconnect();
+    } else if (strcmp(cmd, "stat") == 0) {
+        wifi_bridge_debug_dump();
+    } else if (strcmp(cmd, "set") == 0 && arg) {
+        // wifi set <ssid> <pass>
+        char* ssid = arg;
+        char* pass = strchr(arg, ' ');
+        if (pass) { *pass++ = 0; }
+        if (!pass || !*pass) {
+            LOGE("usage: wifi set <ssid> <pass>");
+            return;
+        }
+        wifi_bridge_save_credentials(ssid, pass);
+    } else if (strcmp(cmd, "broker") == 0 && arg) {
+        extern void wifi_bridge_set_broker(const char* host);
+        // 선언 안 했으므로 inline으로는 안 됨. 직접 구조 변경 필요.
+        LOGW("'wifi broker' not supported yet, edit BC_MQTT_BROKER macro");
+    } else {
+        LOGE("unknown wifi subcommand: %s", cmd);
+    }
+}
+
 static void process_serial_input(void) {
     while (Serial.available()) {
         char c = Serial.read();
@@ -121,6 +191,8 @@ static void process_serial_input(void) {
 
                 if (strcmp(cmd, "bl") == 0) {
                     handle_blacklist_command(args);
+                } else if (strcmp(cmd, "wifi") == 0) {
+                    handle_wifi_command(args);
                 } else if (strcmp(cmd, "help") == 0) {
                     print_help();
                 } else if (strcmp(cmd, "") != 0) {
@@ -196,14 +268,28 @@ void setup() {
     } else {
         LOGI("LoRa module not detected - BLE-only mode");
     }
+
+    // WiFi + MQTT 브릿지 초기화 (실제 연결은 Serial 'wifi on' 명령 필요)
+    // 자동 연결하지 않음 - 사용자가 WiFi를 명시적으로 켤 때만 동작 (BLE 우선)
+    if (wifi_bridge_init()) {
+        LOGI("WiFi bridge ready (use 'wifi on' to connect, 'wifi set <s> <p>' to save creds)");
+    } else {
+        LOGW("WiFi bridge init failed");
+    }
 }
 
 void loop() {
-    // Serial 명령 처리 - 블랙리스트 실시간 관리
+    // Serial 명령 처리 - 블랙리스트 + WiFi 실시간 관리
     process_serial_input();
 
     // BLE relay 메인 루프
     g_relay.loop();
+
+    // WiFi + MQTT 브릿지 - keep-alive + 수신 패킷 처리
+    // (활성화된 경우에만 동작, BLE보다 낮은 우선순위)
+    if (wifi_bridge_is_enabled()) {
+        wifi_bridge_loop();
+    }
 
     // 전원 관리 - 유휴 시 라이트 슬립 + 상태 LED + 배터리 모니터링
     power_handle_idle();
@@ -234,6 +320,10 @@ void loop() {
         // LoRa 모듈 상태 (감지된 경우)
         if (lora_relay_is_detected()) {
             lora_relay_debug_dump();
+        }
+        // WiFi 브릿지 상태 (활성화된 경우만)
+        if (wifi_bridge_is_enabled()) {
+            wifi_bridge_debug_dump();
         }
     }
 

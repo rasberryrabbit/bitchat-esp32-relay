@@ -16,6 +16,7 @@
 #include "retry_queue.h"
 #include "blacklist.h"
 #include "lora_relay.h"
+#include "wifi_bridge.h"
 
 #include <cstring>
 #include <algorithm>
@@ -387,6 +388,12 @@ void BitchatRelay::forward_to_others(const uint8_t* data, size_t len,
     //    BLE에서 들어온 패킷을 LoRa로도 송신 → 장거리 메시 확장
     if (lora_relay_is_detected()) {
         lora_relay_broadcast(data, len);
+    }
+
+    // 0.5) WiFi/MQTT로도 브로드캐스트 (BLE↔인터넷 브릿지)
+    //      Serial 'wifi on'으로 활성화된 경우에만 동작
+    if (wifi_bridge_is_connected()) {
+        wifi_bridge_publish(data, len);
     }
 
     // 1) 모든 incoming clients에게 notify (NimBLE notify(data, len) 한 번에)
