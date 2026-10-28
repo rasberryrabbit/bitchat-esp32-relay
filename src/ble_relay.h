@@ -43,11 +43,11 @@
 //   - Bluedroid: SRAM 제약으로 C3=4, classic/S3=7
 //   - NimBLE: CONFIG_BT_NIMBLE_MAX_CONNECTIONS=9 + NimBLE이 client/server 통합 관리
 //     따라서 9개를 in/out으로 분배. ESP32 BLE 컨트롤러 최대 9개.
-#ifdef BC_BOARD_IS_C3
+#ifdef BOARD_VARIANT_ESP32C3
 #define BC_MAX_OUT_CONN       4   // C3 + NimBLE: 4 outgoing (안전 마진) (Bluedroid 2 → 4)
 #define BC_MAX_IN_CONN        4   // C3 + NimBLE: 4 incoming (안전 마진) (Bluedroid 2 → 5)
                                   // 총 9 (NimBLE 한계 9 중 사용)
-#elif defined(BC_BOARD_IS_S3)
+#elif defined(BOARD_VARIANT_ESP32S3)
 #define BC_MAX_OUT_CONN       4   // S3 + NimBLE: 4 outgoing (안전 마진)
 #define BC_MAX_IN_CONN        4   // S3 + NimBLE: 4 incoming (안전 마진)
                                   // 총 9 (NimBLE 한계 9 중 사용)
@@ -61,7 +61,7 @@
 #define BC_DEDUP_CACHE_SIZE   64
 
 // 패킷 수신 큐 길이 (FreeRTOS queue)
-#ifdef BC_BOARD_IS_C3
+#ifdef BOARD_VARIANT_ESP32C3
 #define BC_PKT_QUEUE_LEN      12   // C3 + NimBLE: 8 → 12 (heap 여유)
 #else
 #define BC_PKT_QUEUE_LEN      16

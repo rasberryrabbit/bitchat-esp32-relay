@@ -39,8 +39,10 @@ void setup() {
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
     Serial.println(" build: " __DATE__ " " __TIME__);
-#if defined(BC_BOARD_IS_C3)
+#if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
+#elif defined(BOARD_VARIANT_ESP32S3)
+    Serial.println(" target: ESP32-S3 (Xtensa LX7, BLE 5.0 + USB-OTG)");
 #elif defined(BOARD_VARIANT_ESP32)
     Serial.println(" target: ESP32 classic (Xtensa LX6, BLE 4.2)");
 #else

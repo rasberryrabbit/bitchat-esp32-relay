@@ -134,11 +134,34 @@ pio run -e esp32s3        # ESP32-S3 + 배터리
 # USB 상시 전원 모드 (이전 동작)
 pio run -e esp32dev-usb   # ESP32 클래식 + USB
 pio run -e esp32c3-usb    # ESP32-C3 + USB
+
+# LoRa 통합 보드 전용 (보드별 LED/배터리 핀 매핑 자동 적용)
+pio run -e heltec_v2      # Heltec WiFi LoRa 32 V2 / TTGO LoRa32 V1.x (LED=25, BAT_ADC=13)
+pio run -e heltec_v2-usb  # Heltec V2 + USB 상시
+pio run -e t-beam         # TTGO T-Beam V1.x (AXP192 PMU 경유 - LED/ADC 비활성)
+pio run -e t-beam-usb     # T-Beam + USB 상시
 ```
+
+> **LoRa 통합 보드 사용 시 참고**:
+> - Heltec V2는 LED가 GPIO 25에 있습니다 (GPIO 2 아님). `heltec_v2` env를 쓰면 자동으로 매핑됩니다.
+> - Heltec V2의 배터리 전압 분배는 GPIO 13 (ADC2)에 있습니다. **WiFi bridge(`wifi on` 명령)를 활성화하면 ADC2가 동작하지 않아 배터리 측정이 무효**합니다. BLE-only 운영 시에만 유효합니다.
+> - TTGO T-Beam V1.x는 배터리 전압과 LED가 모두 AXP192 PMU (I2C addr 0x34)를 통해 제어됩니다. `t-beam` env에서는 LED/ADC를 모두 비활성화(`0xFF`)합니다. **정확한 배터리 측정 + LED 제어를 원하면 AXP192 I2C 드라이버 추가가 필요합니다** (TODO, 현재 미구현).
+> - LoRa 자동 감지는 Heltec V2와 T-Beam 모두 동일한 SPI 핀(SCK=5, MISO=19, MOSI=27, CS=18)을 공유하지만 RST 핀만 다릅니다(Heltec=14, T-Beam=23). `lora_relay_begin()`이 두 후보를 순차 시도하여 첫 번째로 인식되는 모듈을 사용합니다.
 
 ESP-IDF에서는 `idf.py menuconfig`에서 `CONFIG_PM_ENABLE`를 켜면 자동으로 배터리 모드 활성화.
 
 Arduino IDE에서는 build flags에 `-DBC_POWER_BATTERY=1`을 추가 (또는 생략 시 자동 배터리 모드).
+
+Arduino IDE에서 Heltec V2를 빌드하려면 Tools > Custom Build Properties에 다음을 추가:
+```
+-DDBC_LED_PIN=25
+-DDBC_BATTERY_ADC_PIN=13
+```
+T-Beam에서는 대신:
+```
+-DDBC_LED_PIN=255
+-DDBC_BATTERY_ADC_PIN=255
+```
 
 ---
 
@@ -673,7 +696,7 @@ CONFIG_ESP32_WIFI_SOFTAP_SUPPORT=n   # STA만 사용
 ```
 bitchat-esp32-relay/
 ├── README.md                      # 이 파일
-├── platformio.ini                 # PlatformIO 빌드 (5 envs: esp32dev/c3/s3 + USB 변형)
+├── platformio.ini                 # PlatformIO 빌드 (9 envs: esp32dev/c3/s3 + USB 변형 + heltec_v2/t-beam)
 ├── CMakeLists.txt                 # ESP-IDF 루트
 ├── sdkconfig.defaults             # ESP-IDF 기본 (ESP32 공통 + PM/tickless + BLE coex)
 ├── sdkconfig.defaults.esp32c3     # ESP-IDF C3 전용 오버라이드

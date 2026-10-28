@@ -15,6 +15,15 @@
  * 컴파일 옵션:
  *   -DBC_POWER_BATTERY=1  : 배터리 모드 활성화 (기본값)
  *   -DBC_POWER_USB_ALWAYS=1 : USB 상시 전원 모드 (이전 동작 유지)
+ *
+ * 보드별 LED/ADC 핀 override:
+ *   platformio.ini에서 -DBC_LED_PIN=<n> 또는 -DBC_BATTERY_ADC_PIN=<n> 으로 직접 지정 가능.
+ *   미지정 시 아래 보드 분기값 사용. 0xFF(=255) = 비활성.
+ *   - ESP32 classic DevKitC: LED=2, BAT_ADC=35
+ *   - Heltec WiFi LoRa 32 V2:  LED=25, BAT_ADC=13 (ADC2 - WiFi 켜지면 사용 불가)
+ *   - TTGO T-Beam V1.x:        LED=0xFF (AXP192 경유), BAT_ADC=0xFF (AXP192 I2C 경유)
+ *   - ESP32-C3 DevKitM-1:      LED=8,  BAT_ADC=35
+ *   - ESP32-S3 DevKitC-1:      LED=5 (외부 LED), BAT_ADC=35
  */
 
 #pragma once
@@ -27,21 +36,32 @@ extern "C" {
 #endif
 
 // 상태 LED 핀 (보드별 분기)
-//   - ESP32 클래식: GPIO 2 (DevKitC 온보드 LED)
-//   - ESP32-C3:      GPIO 8 (DevKitM-1 온보드 LED)
-//   - ESP32-S3:      GPIO 5 (온보드 LED가 WS2812이라 simple digitalWrite 불가 →
-//                    외부 LED용 GPIO 5 사용, SPI/Flash/USB/UART/Strapping 핀 모두 무관)
-#ifdef BC_BOARD_IS_C3
-#define BC_LED_PIN          8       // ESP32-C3-DevKitM-1 온보드 LED
-#elif defined(BC_BOARD_IS_S3)
-#define BC_LED_PIN          5       // ESP32-S3 외부 LED (GPIO 5 - SPI/Flash/USB 무관)
-#else
-#define BC_LED_PIN          2       // ESP32 DevKitC V4 온보드 LED
+//   - platformio.ini에서 -DBC_LED_PIN=<n> 으로 직접 override 가능
+//   - 0xFF(=255) = LED 비활성 (상태 표시 안 함)
+//   - ESP32 클래식:   GPIO 2  (DevKitC 온보드 LED)
+//   - ESP32-C3:        GPIO 8  (DevKitM-1 온보드 LED)
+//   - ESP32-S3:        GPIO 5  (외부 LED용 - SPI/Flash/USB/UART/Strapping 핀 무관)
+//   - Heltec V2:       GPIO 25 (온보드 user LED - esphome 정식 pinout 확인됨)
+//   - TTGO T-Beam V1:  GPIO 0xFF (AXP192 PMU 경유, 직접 GPIO 제어 불가)
+#ifndef BC_LED_PIN
+#  ifdef BOARD_VARIANT_ESP32C3
+#    define BC_LED_PIN          8       // ESP32-C3-DevKitM-1 온보드 LED
+#  elif defined(BOARD_VARIANT_ESP32S3)
+#    define BC_LED_PIN          5       // ESP32-S3 외부 LED (GPIO 5)
+#  else
+#    define BC_LED_PIN          2       // ESP32 DevKitC V4 온보드 LED
+#  endif
 #endif
 
 // 배터리 ADC 설정 (GPIO 35 = ADC1_CH7, 전압 분배 2:1)
 //   LiPo 4.2V → ADC 2.1V → 11dB attenuation으로 측정 가능
-#define BC_BATTERY_ADC_PIN   35
+//   - platformio.ini에서 -DBC_BATTERY_ADC_PIN=<n> 으로 override 가능
+//   - 0xFF(=255) = ADC 비활성 (배터리 측정 안 함)
+//   - T-Beam V1.x는 AXP192 PMU (I2C addr 0x34)로 배터리 읽기 때문에 GPIO ADC 불가
+//   - Heltec V2는 GPIO 13 (ADC2_CH4) 사용하지만 WiFi 켜지면 ADC2 동작 안 함
+#ifndef BC_BATTERY_ADC_PIN
+#  define BC_BATTERY_ADC_PIN   35
+#endif
 #define BC_BATTERY_DIVIDER_R1 100000.0f  // 100kΩ (배터리 측)
 #define BC_BATTERY_DIVIDER_R2 100000.0f  // 100kΩ (GND 측)
 // 분배비 = (R1+R2)/R2 = 2.0 → ADC 값 * 2 = 실제 배터리 전압
