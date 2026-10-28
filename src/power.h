@@ -26,10 +26,15 @@
 extern "C" {
 #endif
 
-// 상태 LED 핀 (ESP32 DevKitC의 온보드 LED)
-// C3는 보통 GPIO 8 또는 2, ESP32 클래식은 GPIO 2
+// 상태 LED 핀 (보드별 분기)
+//   - ESP32 클래식: GPIO 2 (DevKitC 온보드 LED)
+//   - ESP32-C3:      GPIO 8 (DevKitM-1 온보드 LED)
+//   - ESP32-S3:      GPIO 5 (온보드 LED가 WS2812이라 simple digitalWrite 불가 →
+//                    외부 LED용 GPIO 5 사용, SPI/Flash/USB/UART/Strapping 핀 모두 무관)
 #ifdef BC_BOARD_IS_C3
 #define BC_LED_PIN          8       // ESP32-C3-DevKitM-1 온보드 LED
+#elif defined(BC_BOARD_IS_S3)
+#define BC_LED_PIN          5       // ESP32-S3 외부 LED (GPIO 5 - SPI/Flash/USB 무관)
 #else
 #define BC_LED_PIN          2       // ESP32 DevKitC V4 온보드 LED
 #endif

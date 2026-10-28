@@ -111,13 +111,14 @@ ESP32-C3 (DevKitM-1)
 └── 3.3V     ─── LDO → 배터리 (+)
 
 ESP32-S3 (DevKitC-1)
-├── GPIO 48  ─── LED (온보드 RGB - WS2812)
+├── GPIO 5   ─── 외부 LED (온보드 RGB-WS2812는 digitalWrite 미지원 → GPIO 5 사용)
+│               (SPI 10-14, Flash 6-11, USB 19-20, UART 43-44, Strapping 0/3/45/46과 무관)
 ├── GPIO 0   ─── BOOT 버튼 (딥슬립 wake)
 ├── GPIO 4   ─── 배터리 ADC (분배 2:1)
 └── 3.3V     ─── LDO → 배터리 (+)
 ```
 
-> S3의 온보드 LED는 WS2812 (RGB)라 simple digitalWrite로는 안 켜질 수 있음. `BC_LED_PIN`을 일반 GPIO로 변경 권장.
+> S3의 온보드 RGB LED(GPIO 48)는 WS2812라 simple digitalWrite로 제어 불가 → 외부 LED를 GPIO 5에 연결 권장. GPIO 5는 모든 SPI/Flash/USB/UART/Strapping 핀과 무관하여 안전.
 
 ### 빌드 환경별 모드 선택
 
