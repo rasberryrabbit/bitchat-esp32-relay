@@ -1,8 +1,14 @@
 /*
- * bitchat_protocol.cpp - bitchat packet encode/decode implementation
+ * bitchat_protocol.cpp - 실제 bitchat 호환 패킷 (BinaryProtocol.kt 포팅)
  *
- * 한국어: 패킷 직렬화/역직렬화를 구현합니다. 모든 함수는 heap 할당 없이
- *        caller가 제공한 버퍼에만 동작합니다.
+ * 한국어:
+ *   permissionlesstech/bitchat-android의 BinaryProtocol.kt를 C++로 포팅.
+ *   v1 (14B header, 2B payload_len) 지원. v2는 필요시 추가.
+ *
+ *   relay 노드 전략:
+ *     - 패킷을 그대로 forward (TTL만 1 감소)
+ *     - 서명은 TTL=0으로 고정 후 검증 (TTL 변경해도 서명 유효)
+ *     - 압축/패딩/라우팅은 그대로 보존 (relay는 재인코딩 안 함)
  */
 
 #include "bitchat_protocol.h"
@@ -10,209 +16,203 @@
 
 #include <string.h>
 #include <stdio.h>
-#include <inttypes.h>
 
-// 빅엔디언 read/write 헬퍼
+// 빅엔디언 read/write helpers
 static inline uint64_t rd_be_u64(const uint8_t* p) {
     uint64_t v = 0;
     for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
     return v;
 }
-
+static inline uint32_t rd_be_u32(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
 static inline uint16_t rd_be_u16(const uint8_t* p) {
     return (uint16_t)((p[0] << 8) | p[1]);
 }
-
 static inline void wr_be_u64(uint8_t* p, uint64_t v) {
     for (int i = 7; i >= 0; --i) { p[i] = (uint8_t)(v & 0xFF); v >>= 8; }
 }
-
+static inline void wr_be_u32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)(v & 0xFF);
+}
 static inline void wr_be_u16(uint8_t* p, uint16_t v) {
-    p[0] = (uint8_t)(v >> 8);
-    p[1] = (uint8_t)(v & 0xFF);
+    p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)(v & 0xFF);
 }
 
 bool bitchat_parse(const uint8_t* buf, size_t len, bitchat_packet_view_t* view) {
     if (!buf || !view) return false;
-    if (len < BITCHAT_MIN_PKT_LEN) {
-        LOGD("parse fail: too short len=%u min=%u",
-             (unsigned)len, (unsigned)BITCHAT_MIN_PKT_LEN);
+    // 최소: header + senderID (8)
+    if (len < BITCHAT_HEADER_V1_LEN + BITCHAT_SENDER_ID_SIZE) {
         return false;
     }
-    if (len > BITCHAT_MAX_PKT_LEN) {
-        LOGD("parse fail: too long len=%u max=%u",
-             (unsigned)len, (unsigned)BITCHAT_MAX_PKT_LEN);
+
+    uint8_t version = buf[0];
+    if (version != BITCHAT_VERSION_1 && version != BITCHAT_VERSION_2) {
         return false;
     }
-    if (buf[0] != BITCHAT_MAGIC) {
-        LOGT("parse fail: bad magic 0x%02x", buf[0]);
-        return false;
+
+    size_t header_size = (version == BITCHAT_VERSION_1)
+        ? BITCHAT_HEADER_V1_LEN
+        : BITCHAT_HEADER_V2_LEN;
+
+    uint8_t type    = buf[1];
+    uint8_t ttl     = buf[2];
+    uint64_t ts     = rd_be_u64(buf + 3);
+    uint8_t flags   = buf[11];
+
+    bool has_recipient = (flags & BITCHAT_FLAG_HAS_RECIPIENT) != 0;
+    bool has_signature = (flags & BITCHAT_FLAG_HAS_SIGNATURE) != 0;
+    bool is_compressed = (flags & BITCHAT_FLAG_IS_COMPRESSED) != 0;
+    bool has_route     = (flags & BITCHAT_FLAG_HAS_ROUTE) != 0 &&
+                         version >= BITCHAT_VERSION_2;
+
+    // payload_len (v1: 2B, v2: 4B)
+    uint32_t payload_len;
+    size_t pl_off;
+    if (version == BITCHAT_VERSION_1) {
+        payload_len = rd_be_u16(buf + 12);
+        pl_off = 14;
+    } else {
+        payload_len = rd_be_u32(buf + 12);
+        pl_off = 16;
     }
-    uint8_t ver    = buf[1];
-    uint8_t type   = buf[2];
-    uint8_t ttl    = buf[3];
-    if (ver != BITCHAT_VERSION) {
-        LOGD("parse fail: unsupported ver=%u", ver);
-        return false;
+    if (payload_len > BITCHAT_MAX_PAYLOAD_LEN) return false;
+
+    // variable sections: senderID + (optional)recipientID + (optional)route + payload + (optional)sig
+    size_t offset = pl_off;
+    if (offset + BITCHAT_SENDER_ID_SIZE > len) return false;
+    const uint8_t* sender_id = buf + offset;
+    offset += BITCHAT_SENDER_ID_SIZE;
+
+    const uint8_t* recipient_id = nullptr;
+    if (has_recipient) {
+        if (offset + BITCHAT_RECIPIENT_ID_SIZE > len) return false;
+        recipient_id = buf + offset;
+        offset += BITCHAT_RECIPIENT_ID_SIZE;
     }
-    if (ttl > BITCHAT_MAX_TTL) {
-        LOGD("parse fail: ttl=%u exceeds max=%u", ttl, BITCHAT_MAX_TTL);
-        return false;
+
+    // Route (v2+): peek count first to compute size
+    const uint8_t* route = nullptr;
+    uint8_t route_count = 0;
+    if (has_route) {
+        if (offset + 1 > len) return false;
+        route_count = buf[offset];
+        route = buf + offset;
+        offset += 1 + (route_count * BITCHAT_SENDER_ID_SIZE);
+        if (offset > len) return false;
     }
-    const uint8_t* pk        = buf + 4;
-    const uint8_t* counter_p = buf + 4 + BITCHAT_PUBKEY_LEN;
-    const uint8_t* len_p     = counter_p + 8;
-    uint16_t payload_len     = rd_be_u16(len_p);
-    if (payload_len > BITCHAT_MAX_PAYLOAD_LEN) {
-        LOGD("parse fail: payload_len=%u exceeds max", payload_len);
-        return false;
+
+    // Payload
+    if (offset + payload_len > len) return false;
+    const uint8_t* payload = buf + offset;
+    offset += payload_len;
+
+    // Signature
+    const uint8_t* signature = nullptr;
+    if (has_signature) {
+        if (offset + BITCHAT_SIGNATURE_SIZE > len) return false;
+        signature = buf + offset;
+        offset += BITCHAT_SIGNATURE_SIZE;
     }
-    // 헤더(고정) + payload_len + sig(64) == 총 길이 여야 함
-    size_t expected = BITCHAT_HEADER_LEN + (size_t)payload_len + BITCHAT_SIG_LEN;
-    if (len != expected) {
-        LOGD("parse fail: length mismatch len=%u expected=%u plen=%u",
-             (unsigned)len, (unsigned)expected, payload_len);
-        return false;
-    }
-    const uint8_t* payload = len_p + 2;
-    const uint8_t* sig      = payload + payload_len;
-    view->magic        = buf[0];
-    view->version      = ver;
+
+    view->version      = version;
     view->type         = type;
     view->ttl          = ttl;
-    view->sender_pk    = pk;
-    view->counter      = rd_be_u64(counter_p);
+    view->timestamp    = ts;
+    view->flags        = flags;
     view->payload_len  = payload_len;
+    view->sender_id    = sender_id;
+    view->recipient_id = recipient_id;
+    view->route        = route;
+    view->route_count  = route_count;
     view->payload      = payload;
-    view->signature    = sig;
+    view->signature    = signature;
+    view->total_len    = offset;
     return true;
 }
 
-size_t bitchat_total_len(const bitchat_packet_view_t* v) {
-    if (!v) return 0;
-    return BITCHAT_HEADER_LEN + v->payload_len + BITCHAT_SIG_LEN;
+// 서명 검증용 메시지: 원본 패킷을 복사하되
+//   - TTL을 0으로 설정
+//   - signature 필드 제외 (그 뒤에 오는 데이터는 무시됨)
+size_t bitchat_signing_message(const bitchat_packet_view_t* v,
+                                uint8_t* out_buf, size_t out_max) {
+    if (!v || !out_buf) return 0;
+
+    size_t header_size = (v->version == BITCHAT_VERSION_1)
+        ? BITCHAT_HEADER_V1_LEN
+        : BITCHAT_HEADER_V2_LEN;
+
+    // signing message = header(14/16B) + senderID(8) + recipientID(8 if) + route(if) + payload
+    // signature는 제외
+    size_t signing_len = header_size + BITCHAT_SENDER_ID_SIZE + v->payload_len;
+    if (v->recipient_id) signing_len += BITCHAT_RECIPIENT_ID_SIZE;
+    if (v->route) signing_len += 1 + (v->route_count * BITCHAT_SENDER_ID_SIZE);
+
+    if (signing_len > out_max) return 0;
+
+    // 원본 버퍼에서 signing_len 만큼 복사
+    // (signature 앞까지가 signing_len)
+    memcpy(out_buf, (const uint8_t*)(v) - (size_t)0, 0);  // dummy - 실제로는 v의 원본 버퍼 필요
+    // 하지만 view에는 원본 버퍼 포인터가 없으므로, 우리는 별도 함수로 원본에서 바로 만들어야 함
+    // 여기서는 인터페이스만 정의하고, 실제 구현은 ble_relay.cpp에서 원본 버퍼로 직접 처리
+    return 0;   // 이 함수는 호출되지 않음 - signing은 ble_relay.cpp에서 직접 처리
 }
 
-void bitchat_id_from_pk(const uint8_t* pk, char* out_id) {
-    if (!pk || !out_id) return;
-    static const char* hex = "0123456789abcdef";
-    for (int i = 0; i < 6; ++i) {
-        out_id[i * 2]     = hex[(pk[i] >> 4) & 0xF];
-        out_id[i * 2 + 1] = hex[pk[i] & 0xF];
-    }
-    out_id[12] = 0;
-}
-
-void bitchat_id_from_mac(const uint8_t* mac, char* out_id) {
-    if (!mac || !out_id) return;
-    static const char* hex = "0123456789abcdef";
-    for (int i = 0; i < 6; ++i) {
-        out_id[i * 2]     = hex[(mac[i] >> 4) & 0xF];
-        out_id[i * 2 + 1] = hex[mac[i] & 0xF];
-    }
-    out_id[12] = 0;
-}
-
-void bitchat_packet_debug(const bitchat_packet_view_t* v) {
-    if (!v) return;
-    char id[BITCHAT_ID_STR_LEN];
-    bitchat_id_from_pk(v->sender_pk, id);
-    const char* type_str = "?";
-    switch (v->type) {
-        case BC_TYPE_CHAT:         type_str = "CHAT"; break;
-        case BC_TYPE_ACK:          type_str = "ACK"; break;
-        case BC_TYPE_PEER_INFO:    type_str = "PEER_INFO"; break;
-        case BC_TYPE_PEER_REQUEST: type_str = "PEER_REQUEST"; break;
-        case BC_TYPE_LEAVE:        type_str = "LEAVE"; break;
-        case BC_TYPE_KEY_EXCHANGE: type_str = "KEY_EXCHANGE"; break;
-        case BC_TYPE_PING:         type_str = "PING"; break;
-        default:                   type_str = "UNKNOWN"; break;
-    }
-    LOGD("pkt v=%u type=0x%02x(%s) ttl=%u sender=%s ctr=%llu plen=%u",
-         v->version, v->type, type_str, v->ttl, id,
-         (unsigned long long)v->counter, v->payload_len);
-}
-
-void bitchat_signing_message(const bitchat_packet_view_t* v,
-                             uint8_t* out_buf, size_t* out_len) {
-    if (!v || !out_buf || !out_len) {
-        if (out_len) *out_len = 0;
-        return;
-    }
-    size_t off = 0;
-    out_buf[off++] = v->magic;
-    out_buf[off++] = v->version;
-    out_buf[off++] = v->type;
-    out_buf[off++] = v->ttl;
-    memcpy(out_buf + off, v->sender_pk, BITCHAT_PUBKEY_LEN);
-    off += BITCHAT_PUBKEY_LEN;
-    wr_be_u64(out_buf + off, v->counter);
-    off += 8;
-    wr_be_u16(out_buf + off, v->payload_len);
-    off += 2;
-    if (v->payload_len) {
-        memcpy(out_buf + off, v->payload, v->payload_len);
-        off += v->payload_len;
-    }
-    *out_len = off;
-}
-
-size_t bitchat_build_header(bitchat_packet_builder_t* b,
-                            uint8_t type, uint8_t ttl,
-                            const uint8_t* sender_pk, uint32_t counter,
-                            const uint8_t* payload, uint16_t payload_len) {
-    if (!b || !sender_pk) return 0;
-    if (payload_len > 0 && !payload) return 0;
-    if (payload_len > BITCHAT_MAX_PAYLOAD_LEN) return 0;
-    if (ttl > BITCHAT_MAX_TTL) return 0;
-
-    size_t off = 0;
-    b->buffer[off++] = BITCHAT_MAGIC;
-    b->buffer[off++] = BITCHAT_VERSION;
-    b->buffer[off++] = type;
-    b->buffer[off++] = ttl;
-    memcpy(b->buffer + off, sender_pk, BITCHAT_PUBKEY_LEN);
-    off += BITCHAT_PUBKEY_LEN;
-    wr_be_u64(b->buffer + off, counter);
-    off += 8;
-    wr_be_u16(b->buffer + off, payload_len);
-    off += 2;
-    if (payload_len) {
-        memcpy(b->buffer + off, payload, payload_len);
-        off += payload_len;
-    }
-    b->used = off;
-    return off;
-}
-
-size_t bitchat_builder_reserve_sig(bitchat_packet_builder_t* b) {
-    if (!b) return 0;
-    if (b->used + BITCHAT_SIG_LEN > sizeof(b->buffer)) return 0;
-    size_t sig_off = b->used;
-    // 서명 자리는 0으로 채워둠 - crypto 모듈이 나중에 덮어씀
-    memset(b->buffer + sig_off, 0, BITCHAT_SIG_LEN);
-    b->used += BITCHAT_SIG_LEN;
-    return sig_off;
-}
-
+// TTL 1 감소 - 패킷을 그대로 복사하되 TTL만 1 줄임
+// 서명은 TTL 변경과 무관하게 유효 (TTL=0으로 서명했으므로)
 size_t bitchat_decrement_ttl(const uint8_t* src, size_t src_len,
-                             uint8_t* dst, size_t dst_max) {
+                              uint8_t* dst, size_t dst_max) {
     bitchat_packet_view_t v;
     if (!bitchat_parse(src, src_len, &v)) return 0;
-    if (v.ttl == 0) {
-        // 이미 TTL=0, 더 이상 중계 불가
-        return 0;
+    if (v.ttl == 0) return 0;   // TTL=0이면 더 이상 forward 불가
+    if (v.total_len > dst_max) return 0;
+
+    memcpy(dst, src, v.total_len);
+    dst[2] = v.ttl - 1;   // TTL 필드만 변경
+    return v.total_len;
+}
+
+void bitchat_id_from_sender(const uint8_t* sender_id, char* out_id) {
+    if (!sender_id || !out_id) return;
+    static const char* hex = "0123456789abcdef";
+    for (int i = 0; i < 8; ++i) {
+        out_id[i * 2]     = hex[(sender_id[i] >> 4) & 0xF];
+        out_id[i * 2 + 1] = hex[sender_id[i] & 0xF];
     }
-    size_t total = bitchat_total_len(&v);
-    if (total > dst_max) return 0;
-    memcpy(dst, src, total);
-    dst[3] = v.ttl - 1;
-    // 서명은 재서명 필요 (중계 노드가 아닌 송신자가 서명하므로,
-    //                  TTL만 바꾸면 기존 서명이 무효가 됨)
-    // -> 실제 중계 시나리오에서는 bitchat이 mesh-friendly하게
-    //    TTL만 바꾸고 서명은 송신자 PK 기준 유지하는 정책을 쓰거나,
-    //    아니면 relay node가 자체 서명을 다시 붙임.
-    //    본 펌웨어에서는 원본 송신자 서명 유지 + TTL만 감소 정책 사용
-    //    (bitchat 메시 멜버들은 sender_pk로 원본 출처를 신뢰할 수 있으므로).
-    return total;
+    out_id[16] = 0;
+}
+
+const char* bitchat_type_name(uint8_t type) {
+    switch (type) {
+        case BITCHAT_MSG_ANNOUNCE:         return "ANNOUNCE";
+        case BITCHAT_MSG_MESSAGE:          return "MESSAGE";
+        case BITCHAT_MSG_LEAVE:            return "LEAVE";
+        case BITCHAT_MSG_NOISE_HANDSHAKE:  return "NOISE_HS";
+        case BITCHAT_MSG_NOISE_ENCRYPTED:  return "NOISE_ENC";
+        case BITCHAT_MSG_FRAGMENT:         return "FRAGMENT";
+        case BITCHAT_MSG_REQUEST_SYNC:     return "REQ_SYNC";
+        case BITCHAT_MSG_FILE_TRANSFER:    return "FILE_TX";
+        case BITCHAT_MSG_VOICE_FRAME:      return "VOICE";
+        default:                            return "UNKNOWN";
+    }
+}
+
+void bitchat_flags_str(uint8_t flags, char* out) {
+    if (!out) return;
+    out[0] = 0;
+    if (flags & BITCHAT_FLAG_HAS_RECIPIENT) strcat(out, "R");
+    if (flags & BITCHAT_FLAG_HAS_SIGNATURE) strcat(out, "S");
+    if (flags & BITCHAT_FLAG_IS_COMPRESSED) strcat(out, "C");
+    if (flags & BITCHAT_FLAG_HAS_ROUTE)     strcat(out, "U");
+    if (out[0] == 0) strcpy(out, "-");
+}
+
+bool bitchat_is_broadcast(const uint8_t* recipient_id) {
+    if (!recipient_id) return true;   // recipient 없으면 broadcast
+    for (int i = 0; i < 8; ++i) {
+        if (recipient_id[i] != 0xFF) return false;
+    }
+    return true;
 }

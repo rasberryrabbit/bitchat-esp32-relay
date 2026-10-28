@@ -49,7 +49,7 @@ void retry_enqueue(const uint8_t* packet, size_t len) {
 
     // 해시 키 계산
     uint8_t hash[BC_RETRY_HASH_LEN];
-    compute_hash(v.sender_pk, v.counter, hash);
+    compute_hash(v.sender_id, v.timestamp, hash);
 
     // 이미 큐에 같은 해시가 있으면 갱신하지 않음 (중복 enqueue 방지)
     for (int i = 0; i < BC_RETRY_QUEUE_SIZE; ++i) {
@@ -98,9 +98,9 @@ void retry_enqueue(const uint8_t* packet, size_t len) {
     g_stats.pending_count++;
 
     char id[BITCHAT_ID_STR_LEN];
-    bitchat_id_from_pk(v.sender_pk, id);
+    bitchat_id_from_pk(v.sender_id, id);
     LOGD("retry_enqueue: slot=%d id=%s ctr=%llu", slot, id,
-         (unsigned long long)v.counter);
+         (unsigned long long)v.timestamp);
 }
 
 bool retry_check_passive_ack(const uint8_t* sender_pk, uint64_t counter) {

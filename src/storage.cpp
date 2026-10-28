@@ -89,15 +89,25 @@ bool storage_init(bitchat_storage_t* st) {
              (unsigned long long)ctr);
     }
 
-    // 3. 피어 목록 불러오기 (없으면 빈 상태로 시작)
-    size_t peers_sz = 0;
-    err = nvs_get_blob(h, BC_NVS_KEY_PEERS, NULL, &peers_sz);
-    if (err == ESP_OK && peers_sz > 0 && peers_sz <= sizeof(st->peers)) {
-        nvs_get_blob(h, BC_NVS_KEY_PEERS, st->peers, &peers_sz);
-        st->peer_count = (uint8_t)(peers_sz / sizeof(bitchat_peer_t));
-        LOGI("loaded %u peers from NVS", st->peer_count);
-    } else {
+    // 3. 피어 목록 불러오기 (v2 포맷 체크 - 8B senderID 마이그레이션)
+    uint32_t peer_ver = 0;
+    nvs_get_u32(h, "pver", &peer_ver);
+    if (peer_ver != 2) {
+        LOGI("peer cache: version %u != 2, clearing old 32B-format data", peer_ver);
+        nvs_erase_key(h, BC_NVS_KEY_PEERS);
+        nvs_set_u32(h, "pver", 2);
+        nvs_commit(h);
         st->peer_count = 0;
+    } else {
+        size_t peers_sz = 0;
+        err = nvs_get_blob(h, BC_NVS_KEY_PEERS, NULL, &peers_sz);
+        if (err == ESP_OK && peers_sz > 0 && peers_sz <= sizeof(st->peers)) {
+            nvs_get_blob(h, BC_NVS_KEY_PEERS, st->peers, &peers_sz);
+            st->peer_count = (uint8_t)(peers_sz / sizeof(bitchat_peer_t));
+            LOGI("loaded %u peers from NVS (v2, 8B senderID)", st->peer_count);
+        } else {
+            st->peer_count = 0;
+        }
     }
 
     st->ready = true;
@@ -136,7 +146,7 @@ bool storage_add_peer(bitchat_storage_t* st, const uint8_t* pk) {
                 sizeof(bitchat_peer_t) * (BC_MAX_PEERS - 1));
         st->peer_count = BC_MAX_PEERS - 1;
     }
-    memcpy(st->peers[st->peer_count].public_key, pk, 32);
+    memcpy(st->peers[st->peer_count].sender_id, pk, 8);
     st->peer_count++;
     // NVS에 동기화 (한 번에 bulk write)
     nvs_handle_t h;
@@ -152,7 +162,7 @@ bool storage_add_peer(bitchat_storage_t* st, const uint8_t* pk) {
 bool storage_has_peer(const bitchat_storage_t* st, const uint8_t* pk) {
     if (!st || !pk) return false;
     for (uint8_t i = 0; i < st->peer_count; ++i) {
-        if (memcmp(st->peers[i].public_key, pk, 32) == 0) return true;
+        if (memcmp(st->peers[i].sender_id, pk, 8) == 0) return true;
     }
     return false;
 }
@@ -165,7 +175,7 @@ void storage_debug_dump(const bitchat_storage_t* st) {
     LOGI("self_id=%s ready=%d counter=%llu peers=%u",
          id, st->ready, (unsigned long long)st->self_counter, st->peer_count);
     for (uint8_t i = 0; i < st->peer_count; ++i) {
-        bitchat_id_from_pk(st->peers[i].public_key, id);
+        bitchat_id_from_pk(st->peers[i].sender_id, id);
         LOGI("peer[%u] id=%s", i, id);
     }
 }

@@ -71,7 +71,7 @@ bool splitter_send_chunks(const uint8_t* packet, size_t packet_len,
         return false;
     }
     uint8_t hash[8];
-    compute_hash(v.sender_pk, v.counter, hash);
+    compute_hash(v.sender_id, v.timestamp, hash);
 
     // 청크 수 계산
     size_t num_chunks = (packet_len + BC_CHUNK_PAYLOAD_MAX - 1) / BC_CHUNK_PAYLOAD_MAX;

@@ -31,8 +31,8 @@ extern "C" {
 #define BC_MAX_PEERS       32  // 최대 캐시 피어 수
 
 typedef struct {
-    uint8_t  public_key[32];
-    uint8_t  reserved[32];   // 닉네임/메타정보 확장용
+    uint8_t  sender_id[8];     // bitchat peerID (8 bytes)
+    uint8_t  reserved[24];   // struct size preserved
 } bitchat_peer_t;
 
 typedef struct {

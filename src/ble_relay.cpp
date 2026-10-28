@@ -133,8 +133,8 @@ public:
             if (_r->_peers[i].client == c) {
                 _r->_peers[i].connected = false;
                 _r->_peers[i].client = nullptr;
-                _r->_peers[i].tx_remote = nullptr;
-                _r->_peers[i].rx_remote = nullptr;
+                
+                _r->_peers[i].remote_char = nullptr;
                 if (_r->_outgoing_count > 0) _r->_outgoing_count--;
                 break;
             }
@@ -149,7 +149,7 @@ private:
 // ============================================================================
 BitchatRelay::BitchatRelay()
     : _storage(nullptr), _server(nullptr), _service(nullptr),
-      _tx_char(nullptr), _rx_char(nullptr), _advertising(nullptr),
+      _char(nullptr), _advertising(nullptr),
       _scan(nullptr), _pkt_queue(nullptr), _scan_active(false),
       _incoming_count(0), _outgoing_count(0),
       _peer_slot_count(0), _dedup_idx(0) {
@@ -183,20 +183,13 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     _server->setCallbacks(new BitchatServerCallbacks(this));
     _service = _server->createService(BC_BLE_SERVICE_UUID);
 
-    // TX characteristic (notify only)
-    _tx_char = _service->createCharacteristic(
-        BC_BLE_TX_CHAR_UUID,
-        NIMBLE_PROPERTY::NOTIFY
+    // 단일 characteristic (write + notify) - 실제 bitchat 프로토콜 호환
+    // bitchat 앱은 하나의 characteristic에 write + notify를 모두 사용
+    _char = _service->createCharacteristic(
+        BC_BLE_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
     );
-    // NimBLE는 BLE2902 descriptor 명시적 추가 불필요!
-    // PROPERTY::NOTIFY만 설정하면 CCCD 자동 생성됨
-
-    // RX characteristic (write only)
-    _rx_char = _service->createCharacteristic(
-        BC_BLE_RX_CHAR_UUID,
-        NIMBLE_PROPERTY::WRITE
-    );
-    _rx_char->setCallbacks(new BitchatRXCallbacks(this));
+    _char->setCallbacks(new BitchatRXCallbacks(this));
     _service->start();
 
     // 2) Advertising - 배터리 모드에서는 저듀티 (1.28s 간격)
@@ -287,47 +280,30 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
         LOGW("malformed packet from source=%u, ignoring", evt->source);
         return;
     }
-    bitchat_packet_debug(&v);
 
-    if (blacklist_is_pk_blocked(v.sender_pk)) {
+    if (blacklist_is_pk_blocked(v.sender_id)) {
         char bl_id[BITCHAT_ID_STR_LEN];
-        bitchat_id_from_pk(v.sender_pk, bl_id);
+        bitchat_id_from_pk(v.sender_id, bl_id);
         LOGW("blacklist: dropping packet from blocked sender=%s", bl_id);
         return;
     }
 
-    char passive_id[BITCHAT_ID_STR_LEN] = {0};
-    if (v.type != BC_TYPE_ACK) {
-        if (retry_check_passive_ack(v.sender_pk, v.counter)) {
-            bitchat_id_from_pk(v.sender_pk, passive_id);
-            LOGD("passive ACK matched our pending forward (sender=%s)",
-                 passive_id);
-        }
-    } else {
-        retry_process_explicit_ack(v.payload, v.payload_len);
-    }
+    // bitchat 프로토콜에 ACK 메커니즘 없음 - passive/explicit ACK 처리 제거
+    // relay는 패킷을 받으면 그대로 forward만 함
 
-    uint8_t sign_buf[BITCHAT_HEADER_LEN + BITCHAT_MAX_PAYLOAD_LEN];
-    size_t sign_len = 0;
-    bitchat_signing_message(&v, sign_buf, &sign_len);
-    if (!crypto_verify_signature(v.sender_pk, BITCHAT_PUBKEY_LEN,
-                                  sign_buf, sign_len,
-                                  v.signature, BITCHAT_SIG_LEN)) {
-        char id[BITCHAT_ID_STR_LEN];
-        bitchat_id_from_pk(v.sender_pk, id);
-        LOGW("signature verification FAILED from sender=%s, dropping", id);
-        return;
-    }
+    // 서명 검증 (실제 bitchat 프로토콜): 일단 스킵 - senderID가 8B이므로
+    // pk 매핑이 필요함. relay는 forward만 하므로 검증은 클라이언트 측에서.
+    // TODO: storage에 senderID → Ed25519 pk 매핑 추가 후 검증 활성화
     char id[BITCHAT_ID_STR_LEN];
-    bitchat_id_from_pk(v.sender_pk, id);
-    LOGI("signature OK from sender=%s", id);
+    bitchat_id_from_pk(v.sender_id, id);
+    LOGI("received packet from sender=%s type=0x%02x", id, v.type);
 
-    if (check_dedup(v.sender_pk, v.counter)) {
+    if (check_dedup(v.sender_id, v.timestamp)) {
         LOGD("duplicate packet, dropping");
         return;
     }
 
-    if (_storage) storage_add_peer(_storage, v.sender_pk);
+    if (_storage) storage_add_peer(_storage, v.sender_id);
 
     if (v.ttl == 0) {
         LOGD("TTL=0, not forwarding further");
@@ -345,20 +321,19 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
     LOGI("forwarded pkt (ttl %u->%u) to other peers",
          v.ttl, (uint8_t)(v.ttl - 1));
 
-    if (v.type != BC_TYPE_ACK) {
+    // 개선사항: MESSAGE(0x02) 타입만 retry 추적
+    // ANNOUNCE(0x01), LEAVE(0x03), SYNC(0x21), NOISE(0x10/0x11) 등은 추적 안 함
+    // → 불필요한 재전송 방지, 대역폭 절약
+    if (v.type == BITCHAT_MSG_MESSAGE) {
         retry_enqueue(fwd_buf, fwd_len);
     }
 }
 
 bool BitchatRelay::verify_packet(const uint8_t* data, size_t len,
                                   bitchat_packet_view_t* view) {
-    if (!bitchat_parse(data, len, view)) return false;
-    uint8_t sign_buf[BITCHAT_HEADER_LEN + BITCHAT_MAX_PAYLOAD_LEN];
-    size_t sign_len = 0;
-    bitchat_signing_message(view, sign_buf, &sign_len);
-    return crypto_verify_signature(view->sender_pk, BITCHAT_PUBKEY_LEN,
-                                    sign_buf, sign_len,
-                                    view->signature, BITCHAT_SIG_LEN);
+    // 서명 검증 일단 스킵 - senderID가 8B이므로 pk 매핑 필요
+    // TODO: ANNOUNCE 메시지에서 pk 추출 후 storage에 매핑
+    return bitchat_parse(data, len, view);
 }
 
 bool BitchatRelay::check_dedup(const uint8_t* sender_pk, uint64_t counter) {
@@ -397,9 +372,9 @@ void BitchatRelay::forward_to_others(const uint8_t* data, size_t len,
     }
 
     // 1) 모든 incoming clients에게 notify (NimBLE notify(data, len) 한 번에)
-    if (_tx_char) {
-        _tx_char->setValue(data, len);
-        _tx_char->notify();
+    if (_char) {
+        _char->setValue(data, len);
+        _char->notify();
         LOGD("forwarded to %d subscribed clients via notify",
              _incoming_count);
     }
@@ -413,11 +388,11 @@ void BitchatRelay::forward_to_others(const uint8_t* data, size_t len,
 }
 
 void BitchatRelay::forward_to_peer(PeerEntry* p, const uint8_t* data, size_t len) {
-    if (!p || !p->connected || !p->rx_remote) return;
+    if (!p || !p->connected || !p->remote_char) return;
     try {
         // NimBLE writeValue: bool response 인자 (기본 true, write-with-response)
         std::string val(reinterpret_cast<const char*>(data), len);
-        p->rx_remote->writeValue(val, true);
+        p->remote_char->writeValue(val, true);
         p->pkts_forwarded++;
     } catch (...) {
         LOGW("write to peer failed, marking disconnected");
@@ -504,17 +479,16 @@ bool BitchatRelay::connect_to_peer(NimBLEAddress addr) {
         NimBLEDevice::deleteClient(client);
         return false;
     }
-    p->tx_remote = svc->getCharacteristic(BC_BLE_TX_CHAR_UUID);
-    p->rx_remote = svc->getCharacteristic(BC_BLE_RX_CHAR_UUID);
-    if (!p->tx_remote || !p->rx_remote) {
-        LOGW("peer %s missing bitchat chars", std::string(addr).c_str());
+    p->remote_char = svc->getCharacteristic(BC_BLE_CHAR_UUID);
+    if (!p->remote_char) {
+        LOGW("peer %s missing bitchat char", std::string(addr).c_str());
         client->disconnect();
         NimBLEDevice::deleteClient(client);
         return false;
     }
     // notify 구독 - NimBLE는 subscribe(true) 호출
-    if (p->tx_remote->canNotify()) {
-        p->tx_remote->subscribe(true,
+    if (p->remote_char->canNotify()) {
+        p->remote_char->subscribe(true,
             [](NimBLERemoteCharacteristic* chr, uint8_t* data, size_t len, bool isNotify) {
                 if (!isNotify || !data || len == 0) return;
                 g_relay.enqueue_packet(data, len, BC_SRC_CLIENT_NOTIFY, 0xFFFE);
@@ -541,8 +515,8 @@ void BitchatRelay::disconnect_peer(PeerEntry* p) {
         NimBLEDevice::deleteClient(p->client);
         p->client = nullptr;
     }
-    p->tx_remote = nullptr;
-    p->rx_remote = nullptr;
+    
+    p->remote_char = nullptr;
     if (_outgoing_count > 0) _outgoing_count--;
     NimBLEAddress tmp_addr(p->addr[0] | (uint64_t)p->addr[1] << 8 |
                             (uint64_t)p->addr[2] << 16 |

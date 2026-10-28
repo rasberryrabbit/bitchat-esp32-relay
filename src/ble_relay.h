@@ -32,11 +32,12 @@
 #include "crypto.h"
 #include "storage.h"
 
-// 자체 BLE Service / Characteristic UUID (Bluedroid과 동일)
-#define BC_BLE_SERVICE_UUID   "0000bc00-0000-1000-8000-00805f9b34fb"
-#define BC_BLE_TX_CHAR_UUID   "0000bc01-0000-1000-8000-00805f9b34fb"  // notify (server -> clients)
-#define BC_BLE_RX_CHAR_UUID   "0000bc02-0000-1000-8000-00805f9b34fb"  // write (clients -> server)
-#define BC_BLE_ADV_NAME       "bchat-relay"
+// 자체 BLE Service / Characteristic UUID (실제 bitchat 프로토콜 호환)
+// - Service: F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C (BluetoothMeshService)
+// - Char: A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D (단일 characteristic, write + notify)
+#define BC_BLE_SERVICE_UUID   "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
+#define BC_BLE_CHAR_UUID      "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
+#define BC_BLE_ADV_NAME       "bitchat"
 
 // NimBLE 사용 시 동시 연결 상향
 //   - Bluedroid: SRAM 제약으로 C3=4, classic/S3=7
@@ -98,8 +99,7 @@ private:
     bitchat_storage_t* _storage;
     NimBLEServer*         _server;
     NimBLEService*        _service;
-    NimBLECharacteristic* _tx_char;     // notify
-    NimBLECharacteristic* _rx_char;     // write
+    NimBLECharacteristic* _char;     // 단일 char (write + notify)
     NimBLEAdvertising*    _advertising;
     NimBLEScan*           _scan;
     QueueHandle_t         _pkt_queue;
@@ -112,14 +112,13 @@ private:
         uint8_t  addr[6];
         bool     addr_valid;
         NimBLEClient*  client;
-        NimBLERemoteCharacteristic* tx_remote;
-        NimBLERemoteCharacteristic* rx_remote;
+        NimBLERemoteCharacteristic* remote_char;   // 단일 char (write + notify)
         bool        connected;
         uint32_t    last_seen_ms;
         uint32_t    pkts_forwarded;
 
         PeerEntry() : addr_valid(false), client(nullptr),
-                      tx_remote(nullptr), rx_remote(nullptr),
+                      remote_char(nullptr),
                       connected(false), last_seen_ms(0),
                       pkts_forwarded(0) {
             memset(addr, 0, sizeof(addr));

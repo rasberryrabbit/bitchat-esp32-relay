@@ -1,127 +1,165 @@
 /*
- * bitchat_protocol.h - bitchat wire packet definition
+ * bitchat_protocol.h - 실제 bitchat 호환 패킷 포맷 (BinaryProtocol.kt 기반)
  *
- * 한국어: bitchat 패킷의 이진 포맷 정의 + 직렬화/역직렬화 함수들.
+ * 한국어:
+ *   permissionlesstech/bitchat-android의 BinaryProtocol.kt에서 추출한
+ *   와이어 포맷 100% 호환.
  *
- * 패킷 레이아웃(빅엔디언):
- *   +-----+-----+-----+-----+------------------------+
- *   |magic| ver |type | ttl | sender_pk (32 bytes)   |
- *   +-----+-----+-----+-----+------------------------+
- *   | counter (8 bytes, msb first)                     |
- *   +--------------------------------------------------+
- *   | payload_len (2 bytes, big endian)                |
- *   +--------------------------------------------------+
- *   | payload (variable, 0..MAX_PAYLOAD_LEN)           |
- *   +--------------------------------------------------+
- *   | signature (64 bytes, Ed25519 over header+payload)|
- *   +--------------------------------------------------+
+ *   패킷 레이아웃 (v1, 14-byte header):
  *
- * 검증 규칙:
- *   - magic == 0xBC
- *   - ver   == 1   (현재 릴리즈)
- *   - ttl   <= 7   (메시 무한 루프 방지)
- *   - payload_len <= BITCHAT_MAX_PAYLOAD_LEN
- *   - signature must verify against sender_pk over the
- *     canonical header+counter+payload_len+payload byte stream
+ *   +------+-------+------+---------------------+
+ *   |ver   | type  | ttl  | timestamp (8B BE)    |
+ *   | 1B   | 1B    | 1B   |                      |
+ *   +------+-------+------+---------------------+
+ *   |flags | payload_len (2B BE, v1)            |
+ *   | 1B   |                                       |
+ *   +------+---------------------------------------+
+ *
+ *   Variable sections (순서대로):
+ *   - senderID: 8 bytes (항상)
+ *   - recipientID: 8 bytes (flags & 0x01)
+ *   - route: 1B count + N×8B (v2+만, flags & 0x08)
+ *   - payload: 가변 길이 (압축 시 앞에 originalSize 2B/4B)
+ *   - signature: 64 bytes (flags & 0x02)
+ *
+ *   Message Types:
+ *     0x01 ANNOUNCE - peer discovery
+ *     0x02 MESSAGE  - 모든 사용자 메시지 (private + broadcast)
+ *     0x03 LEAVE
+ *     0x10 NOISE_HANDSHAKE - Noise protocol handshake
+ *     0x11 NOISE_ENCRYPTED - Noise encrypted transport
+ *     0x20 FRAGMENT - 큰 패킷 분할
+ *     0x21 REQUEST_SYNC - GCS-based sync request
+ *     0x22 FILE_TRANSFER - 파일 전송
+ *     0x29 VOICE_FRAME - push-to-talk frame
+ *
+ *   Flags (bit field):
+ *     0x01 HAS_RECIPIENT
+ *     0x02 HAS_SIGNATURE
+ *     0x04 IS_COMPRESSED
+ *     0x08 HAS_ROUTE (v2+ only)
+ *
+ *   서명: Ed25519 over (encoded packet, signature 없이, TTL=0으로)
+ *         → TTL은 relay 중 변경되지만 서명은 유효함
  */
 
 #pragma once
 
 #include <stdint.h>
 #include <stddef.h>
-#include <string.h>
+#include <stdbool.h>
 
-#define BITCHAT_MAGIC            0xBC
-#define BITCHAT_VERSION          0x01
-#define BITCHAT_MAX_TTL          7
-#define BITCHAT_MAX_PAYLOAD_LEN  512
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Ed25519 key & signature sizes (RFC 8032)
-#define BITCHAT_PUBKEY_LEN       32
-#define BITCHAT_SIG_LEN          64
+#define BITCHAT_VERSION_1        1
+#define BITCHAT_VERSION_2        2
 
-// 노드 식별자 - 공개키의 처음 6바이트 hex를 사람 친화적 ID로 사용
-#define BITCHAT_ID_STR_LEN       13   // 12 hex chars + NUL
+#define BITCHAT_HEADER_V1_LEN    14   // ver(1)+type(1)+ttl(1)+ts(8)+flags(1)+plen(2)
+#define BITCHAT_HEADER_V2_LEN    16   // 위와 동일, payload_len만 4B
 
-// 패킷 타입
-enum BitchatPacketType : uint8_t {
-    BC_TYPE_CHAT         = 0x01, // 암호화된 채팅 메시지 (ECDH + AES-GCM)
-    BC_TYPE_ACK          = 0x02, // 수신 확인
-    BC_TYPE_PEER_INFO    = 0x03, // 피어 발견 알림 (닉네임/공개키)
-    BC_TYPE_PEER_REQUEST = 0x04, // 피어 목록 요청
-    BC_TYPE_LEAVE        = 0x05, // 메시 이탈
-    BC_TYPE_KEY_EXCHANGE = 0x06, // ECDH 공개키 교환
-    BC_TYPE_PING         = 0x07, // keep-alive
-    BC_TYPE_RESERVED     = 0xFF
+#define BITCHAT_SENDER_ID_SIZE   8    // peerID 8 bytes (Ed25519 pk 아님)
+#define BITCHAT_RECIPIENT_ID_SIZE 8
+#define BITCHAT_SIGNATURE_SIZE   64
+#define BITCHAT_BROADCAST_ID     0xFF  // 8바이트 모두 0xFF = broadcast
+
+#define BITCHAT_MAX_PAYLOAD_LEN  650  // v2에서 약간 더 큰 payload 허용
+
+// 패킷 사이즈 한계 (header + 8B sender + 8B recipient + payload + 64B sig)
+#define BITCHAT_MAX_PKT_LEN      (BITCHAT_HEADER_V1_LEN + BITCHAT_SENDER_ID_SIZE + \
+                                  BITCHAT_RECIPIENT_ID_SIZE + BITCHAT_MAX_PAYLOAD_LEN + \
+                                  BITCHAT_SIGNATURE_SIZE + 64)   // padding slack
+
+// 최소 패킷 길이 (header + senderID, 서명 없는 최소)
+#define BITCHAT_MIN_PKT_LEN      (BITCHAT_HEADER_V1_LEN + BITCHAT_SENDER_ID_SIZE)
+
+// 하위 호환 alias (기존 BITCHAT_TYPE_*, PUBKEY_LEN, SIG_LEN, ID_STR_LEN)
+#define BITCHAT_PUBKEY_LEN       BITCHAT_SENDER_ID_SIZE      // 8 bytes (실제로는 senderID)
+#define BITCHAT_SIG_LEN          BITCHAT_SIGNATURE_SIZE       // 64 bytes
+#define BITCHAT_ID_STR_LEN       (BITCHAT_SENDER_ID_SIZE * 2 + 1)  // 17
+
+// Legacy type aliases (기존 코드와 호환)
+#define BITCHAT_TYPE_CHAT            BITCHAT_MSG_MESSAGE
+#define BITCHAT_TYPE_ACK             BITCHAT_MSG_MESSAGE       // bitchat에 ACK 없음, MESSAGE로 매핑
+#define BITCHAT_TYPE_PEER_INFO       BITCHAT_MSG_ANNOUNCE
+#define BITCHAT_TYPE_PEER_REQUEST    BITCHAT_MSG_REQUEST_SYNC
+#define BITCHAT_TYPE_LEAVE           BITCHAT_MSG_LEAVE
+#define BITCHAT_TYPE_KEY_EXCHANGE    BITCHAT_MSG_NOISE_HANDSHAKE
+#define BITCHAT_TYPE_PING            BITCHAT_MSG_ANNOUNCE       // PING 대신 ANNOUNCE 사용
+
+// Message types
+enum BitchatType : uint8_t {
+    BITCHAT_MSG_ANNOUNCE         = 0x01,
+    BITCHAT_MSG_MESSAGE          = 0x02,
+    BITCHAT_MSG_LEAVE            = 0x03,
+    BITCHAT_MSG_NOISE_HANDSHAKE  = 0x10,
+    BITCHAT_MSG_NOISE_ENCRYPTED  = 0x11,
+    BITCHAT_MSG_FRAGMENT         = 0x20,
+    BITCHAT_MSG_REQUEST_SYNC     = 0x21,
+    BITCHAT_MSG_FILE_TRANSFER    = 0x22,
+    BITCHAT_MSG_VOICE_FRAME      = 0x29,
 };
 
-// 고정 헤더 크기 (magic, ver, type, ttl, sender_pk, counter, payload_len)
-#define BITCHAT_HEADER_LEN  (1 + 1 + 1 + 1 + BITCHAT_PUBKEY_LEN + 8 + 2)
-// 최소 패킷 크기 = 헤더 + 빈 페이로드 + 서명
-#define BITCHAT_MIN_PKT_LEN (BITCHAT_HEADER_LEN + BITCHAT_SIG_LEN)
-// 최대 패킷 크기 = 헤더 + 최대 페이로드 + 서명
-#define BITCHAT_MAX_PKT_LEN (BITCHAT_HEADER_LEN + BITCHAT_MAX_PAYLOAD_LEN + BITCHAT_SIG_LEN)
+// Flags
+#define BITCHAT_FLAG_HAS_RECIPIENT  0x01
+#define BITCHAT_FLAG_HAS_SIGNATURE  0x02
+#define BITCHAT_FLAG_IS_COMPRESSED  0x04
+#define BITCHAT_FLAG_HAS_ROUTE      0x08
 
-// 패킷을 파싱한 결과 (heap 할당 없음, caller가 제공한 버퍼 참조)
+// 파싱된 패킷 뷰 (원본 버퍼 참조, heap 할당 없음)
 typedef struct {
-    uint8_t  magic;
     uint8_t  version;
     uint8_t  type;
     uint8_t  ttl;
-    const uint8_t* sender_pk;   // 32 bytes
-    uint64_t counter;
-    uint16_t payload_len;
-    const uint8_t* payload;     // payload_len bytes
-    const uint8_t* signature;   // 64 bytes (마지막 필드)
+    uint64_t timestamp;
+    uint8_t  flags;
+    uint32_t payload_len;
+    const uint8_t* sender_id;     // 8 bytes
+    const uint8_t* recipient_id; // 8 bytes (또는 NULL)
+    const uint8_t* route;        // 1B count + N×8B (또는 NULL)
+    uint8_t  route_count;
+    const uint8_t* payload;       // payload_len bytes
+    const uint8_t* signature;     // 64B (또는 NULL)
+    size_t   total_len;
 } bitchat_packet_view_t;
 
-// 자체 패킷 빌드를 위한 writer 구조체 - 헤더를 순서대로 채운 뒤 payload, sig 추가
+// 패킷 빌더
 typedef struct {
     uint8_t  buffer[BITCHAT_MAX_PKT_LEN];
     size_t   used;
 } bitchat_packet_builder_t;
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-// 버퍼를 패킷으로 파싱. 실패 시 false 반환.
-// 성공 시 *view 필드가 버퍼 내부를 가리킴 (caller가 소유권 유지).
+// 패킷 파싱
 bool bitchat_parse(const uint8_t* buf, size_t len, bitchat_packet_view_t* view);
 
-// 전체 패킷 크기 계산 (헤더 + 페이로드 + 서명)
-size_t bitchat_total_len(const bitchat_packet_view_t* v);
+// 서명 검증용 메시지 추출 (TTL=0으로 인코딩, signature 필드 제외)
+// out_buf: 최소 BITCHAT_MAX_PKT_LEN 크기
+// 반환: signing message 길이, 0이면 실패
+size_t bitchat_signing_message(const bitchat_packet_view_t* v,
+                                uint8_t* out_buf, size_t out_max);
 
-// 패킷을 Serial에 hex+구조화된 텍스트로 출력 (log.h 의존)
-void bitchat_packet_debug(const bitchat_packet_view_t* v);
-
-// 서명 메시지를 계산: (magic,ver,type,ttl,sender_pk,counter,payload_len,payload)
-// 결과는 out_buf 에 기록. out_len 바이트 기록됨. out_buf는 최소
-// BITCHAT_HEADER_LEN + payload_len 크기여야 함.
-void bitchat_signing_message(const bitchat_packet_view_t* v,
-                             uint8_t* out_buf, size_t* out_len);
-
-// 사람 친화적 노드 ID를 hex로 생성
-// pk(32B)의 앞 6바이트 -> 12 hex chars (null-terminated)
-void bitchat_id_from_pk(const uint8_t* pk, char* out_id);
-
-// ESP32의 MAC 주소를 pk 대신 임시 발급 키로 사용할 때 보조용
-// (실제 키는 storage/crypto 모듈에서 영속화)
-void bitchat_id_from_mac(const uint8_t* mac, char* out_id);
-
-// 패킷 헤더 빌더 초기화 (sender_pk, type, payload 채우면 헤더까지 완성)
-// 반환값: 사용된 헤더 길이, 실패 시 0
-size_t bitchat_build_header(bitchat_packet_builder_t* b,
-                            uint8_t type, uint8_t ttl,
-                            const uint8_t* sender_pk, uint32_t counter,
-                            const uint8_t* payload, uint16_t payload_len);
-
-// 빌더 끝에 64바이트 서명 필드 자리만 남겨두고 (실제 서명은 crypto 모듈이 채움)
-// 반환값: 서명이 들어갈 오프셋 (실패 시 0)
-size_t bitchat_builder_reserve_sig(bitchat_packet_builder_t* b);
-
-// 패킷 TTL을 1 감소시키고 다시 직렬화 (중계 시 사용)
-// src는 전체 패킷, src_len은 길이, dst는 출력 버퍼
+// TTL 1 감소 후 패킷 재인코딩 (relay가 forward 시 사용)
+// src: 원본 패킷, src_len: 길이, dst: 출력 버퍼
 // 반환: dst에 기록된 바이트 수, 0이면 실패
 size_t bitchat_decrement_ttl(const uint8_t* src, size_t src_len,
-                             uint8_t* dst, size_t dst_max);
+                              uint8_t* dst, size_t dst_max);
+
+// 8바이트 senderID를 hex 문자열로 (16 chars + NUL)
+void bitchat_id_from_sender(const uint8_t* sender_id, char* out_id);
+
+// 하위 호환 alias (기존 bitchat_id_from_pk 호출 유지)
+#define bitchat_id_from_pk(sender_id, out_id) bitchat_id_from_sender(sender_id, out_id)
+
+// 패킷 타입 이름 (디버그)
+const char* bitchat_type_name(uint8_t type);
+
+// flags 이름 문자열 (디버그)
+void bitchat_flags_str(uint8_t flags, char* out);
+
+// broadcast ID 체크
+bool bitchat_is_broadcast(const uint8_t* recipient_id);
+
+#ifdef __cplusplus
+}
+#endif
