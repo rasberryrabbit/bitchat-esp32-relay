@@ -43,6 +43,7 @@
 | **배터리+절전 모드** | ESP-PM 라이트 슬립 + BLE 저듀티 + LED 펄스 + 딥슬립 (GPIO 0 wake) |
 | **NimBLE 스텍** | Bluedroid 대신 NimBLE-Arduino 사용, 메모리 1/3 절약 |
 | **LoRa 자동감지** | SX127x 모듈 자동 인식 (Heltec, TTGO 등 4가지 핀아웃 시도) |
+| **큰 패킷 분할/재조립** | LoRa 222B 한계 우회 - bitchat 패킷(최대 623B)을 16 청크로 분할 후 재조립 |
 | **WiFi/MQTT 브릿지** | Serial 'wifi on'으로 활성화, MQTT bchat/tx ↔ bchat/rx/{node_id} 양방향 |
 | **BLE Optimum coex** | WiFi + BLE 동시 사용 시 BLE pairing 안정성 최우선 모드 |
 | 다중 빌드 지원 | PlatformIO + ESP-IDF + Arduino IDE 3개 환경 모두 빌드 가능 |
@@ -489,6 +490,129 @@ ESP32 칩 하나당 9개가 절대 한계이므로, **10+ 연결이 필요하면
 
 ---
 
+## 큰 패킷 분할/재조립 (packet_splitter)
+
+`src/packet_splitter.h/.cpp`에 LoRa 프레임 한계 222B로 인해 큰 bitchat 패킷(최대 623B)이 drop되는 문제를 해결하기 위한 자동 분할/재조립 모듈.
+
+### 동작 원리
+
+큰 패킷(>222B)이 LoRa로 송신될 때 자동으로 분할되어 여러 청크로 전송되고, 수신 측에서 청크를 모아 원본 패킷을 복원합니다.
+
+**청크 포맷** (14B header + payload, 최대 222B = 헤더 14B + 페이로드 208B):
+
+```
++-------+------+----------+----------+-----------+
+| magic | ver  | total    | index    | hash(8B)   |
+| 0xCF  | 0x01 | chunks   | (0-based)| (sender_pk  |
+|       |      | (1..16)  |          | [0..7] XOR  |
+|       |      |          |          | counter BE)  |
++-------+------+----------+----------+-----------+
+| payload_len (2B)                                  |
++----------------------------------------------------+
+| payload (≤208 bytes)                               |
++----------------------------------------------------+
+```
+
+- **magic 0xCF**: bitchat 원본 패킷 0xBC와 구분
+- **hash**: 원본 패킷 식별용 8B 해시 (sender_pk[0..7] XOR counter[0..7] big-endian)
+- **total_chunks**: 총 청크 수 (최대 16)
+- **chunk_index**: 현재 청크 인덱스 (0-based)
+- **payload_len**: 이 청크의 페이로드 길이
+
+### 분할 시나리오
+
+| 원본 패킷 크기 | 청크 수 | 총 전송량 (오버헤드 14B × 청크 수) |
+|----------------|---------|----------------------------------|
+| ≤ 222B (작은 패킷) | 1 (분할 없음) | +0B |
+| 222B < N ≤ 430B | 2 | +28B (6.5%) |
+| 430B < N ≤ 638B | 3 | +42B (7%) |
+| 623B (최대) | 3 | +42B (7%) |
+
+### 송신 흐름
+
+```
+[BLE 패킷 수신 (큰 패킷)]
+       │
+       ▼
+  forward_to_others
+       │
+       ▼
+  lora_relay_broadcast (len > 222?)
+       │
+       ├── Yes → splitter_send_chunks
+       │           ├── chunk 0/3: [0xCF|0x01|3|0|hash|len][payload_part_0] → LoRa TX
+       │           ├── chunk 1/3: [0xCF|0x01|3|1|hash|len][payload_part_1] → LoRa TX
+       │           └── chunk 2/3: [0xCF|0x01|3|2|hash|len][payload_part_2] → LoRa TX
+       │
+       └── No → LoRa.beginPacket / write / endPacket (그대로)
+```
+
+### 수신 흐름
+
+```
+[LoRa 패킷 수신]
+       │
+       ▼
+  lora_relay_handle_receive
+       │
+       ├── magic 0xCF (chunk) → splitter_receive_chunk
+       │                          │
+       │                          ├── 같은 hash 가진 슬롯 찾기
+       │                          ├── 비트맵에 chunk_index 기록
+       │                          ├── 모든 청크 도착?
+       │                          │   ├── No → 대기 (내부 버퍼에 저장)
+       │                          │   └── Yes → 원본 패킷 복원 → BLE 큐로 enqueue
+       │                          │
+       │                          └── 30초 타임아웃 시 슬롯 drop
+       │
+       └── magic 0xBC (bitchat) → BLE 큐에 바로 enqueue
+```
+
+### 재조립 슬롯
+
+- **16개 동시 슬롯**: 16개의 서로 다른 분할 패킷을 동시에 재조립 가능
+- **메모리 사용량**: 16 × 623B + α = 약 10KB RAM
+- **타임아웃**: 30초 (한 청크라도 30초 내에 안 오면 슬롯 drop)
+- **LRU 정책**: 16개 슬롯 꽉 차면 가장 오래된 슬롯 evict
+
+### Serial 로그 예시
+
+```
+[D][bitchat] lora: packet 580 > frame 222, splitting
+[D][bitchat] splitter: TX chunk 0/3 (208 bytes payload)
+[D][bitchat] splitter: TX chunk 1/3 (208 bytes payload)
+[D][bitchat] splitter: TX chunk 2/3 (164 bytes payload)
+[I][bitchat] splitter: sent 3 chunks for packet (total_len=580, hash=0x8a3f2c1b)
+[I][bitchat] lora: split TX complete (580 bytes → chunks)
+
+[D][bitchat] lora: RX 222 bytes rssi=-65 snr=8.5 (total=18)
+[D][bitchat] splitter: chunk 0/3 stored, mask=0x01 (need 0x07)
+[D][bitchat] lora: RX 222 bytes rssi=-67 snr=8.0 (total=19)
+[D][bitchat] splitter: chunk 1/3 stored, mask=0x03 (need 0x07)
+[D][bitchat] lora: RX 178 bytes rssi=-62 snr=9.5 (total=20)
+[I][bitchat] splitter: ✓ reassembled 3 chunks → 580 bytes (hash=0x8a3f2c1b)
+[I][bitchat] lora: reassembled packet 580 bytes → BLE queue
+```
+
+### 한계 및 설정값
+
+| 항목 | 기본값 | 비고 |
+|------|--------|------|
+| `BC_MAX_CHUNKS_PER_PACKET` | 16 | 최대 청크 수 = 원본 623B / 208B = 3개 필요 |
+| `BC_CHUNK_PAYLOAD_MAX` | 208 | LoRa 프레임 222B - 헤더 14B |
+| `BC_CHUNK_TIMEOUT_MS` | 30000 | 30초 내 미완료 시 슬롯 drop |
+| 동시 재조립 슬롯 | 16 | 16 × 623B = 10KB RAM 추가 |
+
+### 한계
+
+- **청크 순서 보장 안 함**: 먼저 온 청크부터 처리, 비트맵으로 추적
+- **BLE에는 적용 안 됨**: BLE는 NimBLE가 자체 MTU fragmentation 처리 (247B→분할 자동)
+- **MQTT에는 적용 안 됨**: PubSubClient가 buffer 크기 내에서 자동 처리 (BC_MAX_PKT_LEN × 2)
+- **단일 링크 한계**: 다른 relay를 거치면 분할/재조립이 링크마다 독립적으로 동작
+
+
+---
+
 ## WiFi/MQTT 브릿지 (BLE↔인터넷)
 
 `src/wifi_bridge.cpp`에서 WiFi STA + MQTT 클라이언트로 BLE 메시 패킷을 인터넷으로 브릿지합니다.
@@ -565,6 +689,7 @@ bitchat-esp32-relay/
 │   ├── retry_queue.h/.cpp         # ACK 재전송 (패시브 ACK + 타임아웃)
 │   ├── blacklist.h/.cpp           # pk/BLE 주소 블랙리스트 (NVS 영속화)
 │   ├── lora_relay.h/.cpp          # LoRa 자동감지 + BLE↔LoRa 브릿지 (SX127x)
+│   ├── packet_splitter.h/.cpp     # 큰 패킷 분할/재조립 (LoRa 222B 한계 우회)
 │   ├── wifi_bridge.h/.cpp         # WiFi+MQTT 브릿지 (BLE↔인터넷, Serial on/off)
 │   └── ble_relay.h/.cpp           # BLE GATT + relay (NimBLE, 배터리 모드 시 저듀티)
 ├── lib/                           # 외부 라이브러리 (자체 포함)

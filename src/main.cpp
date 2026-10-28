@@ -23,6 +23,7 @@
 #include "blacklist.h"
 #include "lora_relay.h"
 #include "wifi_bridge.h"
+#include "packet_splitter.h"   // 큰 패킷 분할/재조립 - LoRa 메시 전용
 
 bitchat_storage_t g_storage;   // extern-able for wifi_bridge.cpp
 static power_config_t   g_power;
@@ -289,6 +290,13 @@ void loop() {
     // (활성화된 경우에만 동작, BLE보다 낮은 우선순위)
     if (wifi_bridge_is_enabled()) {
         wifi_bridge_loop();
+    }
+
+    // 큰 패킷 분할/재조립 - 30초 타임아웃된 미완료 슬롯 정리 (1초마다)
+    static uint32_t last_splitter_cleanup = 0;
+    if (millis() - last_splitter_cleanup > 1000) {
+        last_splitter_cleanup = millis();
+        splitter_cleanup_timeouts();
     }
 
     // 전원 관리 - 유휴 시 라이트 슬립 + 상태 LED + 배터리 모니터링

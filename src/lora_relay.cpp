@@ -19,6 +19,7 @@
 #include "lora_relay.h"
 #include "log.h"
 #include "ble_relay.h"   // g_relay.enqueue_packet 사용
+#include "packet_splitter.h"   // 큰 패킷 분할/재조립
 
 #include <string.h>
 
@@ -101,6 +102,9 @@ bool lora_relay_begin(uint32_t frequency_hz) {
         LoRa.onReceive(lora_relay_handle_receive);
         LoRa.receive();   // receive mode 진입
 
+        // 큰 패킷 분할/재조립 모듈 초기화
+        splitter_init();
+
         g_lora_detected = true;
         g_active_pinout = *p;
         LOGI("lora: ✓ %s detected (SX127%s, version=0x%02x)",
@@ -130,30 +134,58 @@ const char* lora_relay_get_module_name(void) {
     return g_lora_detected ? g_active_pinout.name : "(none)";
 }
 
+// 분할 송신용 콜백 데이터
+typedef struct {
+    uint32_t chunks_sent;
+    uint32_t bytes_sent;
+    uint32_t failures;
+} split_send_ctx_t;
+
+// 청크 단위 TX 콜백 - splitter_send_chunks가 호출
+static bool chunk_tx_callback(const uint8_t* chunk, size_t len, void* user_data) {
+    (void)user_data;
+    LoRa.beginPacket();
+    LoRa.write(chunk, len);
+    int rc = LoRa.endPacket();
+    if (rc != 1) {
+        LOGW("lora: chunk TX fail (len=%u)", (unsigned)len);
+        return false;
+    }
+    // 수신 모드로 복귀 (LoRa는 TX 후 자동 복귀 안 됨)
+    LoRa.receive();
+    return true;
+}
+
 bool lora_relay_broadcast(const uint8_t* data, size_t len) {
     if (!g_lora_detected) return false;
     if (!data || len == 0) return false;
+
+    // 큰 패킷 → 분할 송신 (packet_splitter 사용)
     if (len > LORA_MAX_FRAME_LEN) {
-        // LoRa 프레임 한계 초과 - drop (향후 fragmentation 추가 가능)
-        g_drops_too_large++;
-        LOGW("lora: packet too large (%u > %u), dropping",
+        LOGD("lora: packet %u > frame %u, splitting",
              (unsigned)len, LORA_MAX_FRAME_LEN);
-        return false;
+        bool ok = splitter_send_chunks(data, len, chunk_tx_callback, nullptr);
+        if (ok) {
+            g_packets_tx++;
+            // 각 청크를 단일 TX로 카운트 (분할 전체를 1개 패킷으로)
+            LOGI("lora: split TX complete (%u bytes → chunks)", (unsigned)len);
+        } else {
+            g_drops_too_large++;
+            LOGW("lora: split TX failed");
+        }
+        return ok;
     }
 
-    // 패킷 전송 시작
+    // 작은 패킷 → 그대로 송신
     LoRa.beginPacket();
     LoRa.write(data, len);
-    int rc = LoRa.endPacket();   // 1 = success
-
+    int rc = LoRa.endPacket();
     if (rc != 1) {
         LOGW("lora: endPacket failed");
         return false;
     }
     g_packets_tx++;
-
-    // 전송 완료 후 자동으로 receive 모드로 복귀
-    LoRa.receive();
+    LoRa.receive();   // 수신 모드로 복귀
     LOGD("lora: TX %u bytes (total=%u)", (unsigned)len, g_packets_tx);
     return true;
 }
@@ -189,8 +221,22 @@ void lora_relay_handle_receive(int packet_size) {
     LOGD("lora: RX %d bytes rssi=%d snr=%.1f (total=%u)",
          read, rssi, snr, g_packets_rx);
 
-    // BLE relay의 큐에 enqueue (BC_SRC_CLIENT_NOTIFY와 동일 처리)
-    // src_conn_id = 0xFFFD로 LoRa 출처 표시 (BLE 다른 값과 구분)
+    // 청크(0xCF)인지 먼저 체크 → 재조립
+    if (splitter_is_chunk(buf, read)) {
+        static uint8_t reassembled[BITCHAT_MAX_PKT_LEN];
+        size_t reassembled_len = 0;
+        if (splitter_receive_chunk(buf, read, reassembled, &reassembled_len)) {
+            // 모든 청크 도착 → 원본 패킷을 BLE 큐로 enqueue
+            LOGI("lora: reassembled packet %u bytes → BLE queue",
+                 (unsigned)reassembled_len);
+            g_relay.enqueue_packet(reassembled, reassembled_len,
+                                    BC_SRC_CLIENT_NOTIFY, 0xFFFD);
+        }
+        // 아직 모자란 청크는 splitter 내부 버퍼에 저장됨
+        return;
+    }
+
+    // 일반 bitchat 패킷(0xBC) → 그대로 BLE 큐에 enqueue
     g_relay.enqueue_packet(buf, (size_t)read, BC_SRC_CLIENT_NOTIFY, 0xFFFD);
 }
 
@@ -207,4 +253,6 @@ void lora_relay_debug_dump(void) {
     LOGI("freq:    %.1f MHz", g_frequency / 1e6);
     LOGI("stats:   rx=%u tx=%u drop_large=%u drop_parse=%u",
          g_packets_rx, g_packets_tx, g_drops_too_large, g_drops_parse_fail);
+    // 큰 패킷 분할/재조립 상태
+    splitter_debug_dump();
 }
