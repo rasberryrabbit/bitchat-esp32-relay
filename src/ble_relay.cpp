@@ -96,6 +96,21 @@ private:
     uint8_t _acc_buf[BLE_ACC_BUF_SIZE];
     size_t _acc_len;
 
+    // 주어진 type 바이트가 bitchat 프로토콜의 유효한 메시지 타입인지 확인
+    // → 가비지 바이트가 우연히 0x01(version)과 일치해도 type 필드로
+    //   정상 패킷인지 가비지인지 구분 가능
+    static bool is_valid_bitchat_type(uint8_t t) {
+        return t == BITCHAT_MSG_ANNOUNCE        // 0x01
+            || t == BITCHAT_MSG_MESSAGE         // 0x02
+            || t == BITCHAT_MSG_LEAVE           // 0x03
+            || t == BITCHAT_MSG_NOISE_HANDSHAKE // 0x10
+            || t == BITCHAT_MSG_NOISE_ENCRYPTED // 0x11
+            || t == BITCHAT_MSG_FRAGMENT        // 0x20
+            || t == BITCHAT_MSG_REQUEST_SYNC    // 0x21
+            || t == BITCHAT_MSG_FILE_TRANSFER   // 0x22
+            || t == BITCHAT_MSG_VOICE_FRAME;    // 0x29
+    }
+
     // 누적 버퍼에서 완전한 패킷 추출 (0개 이상 추출 가능)
     void extract_packets() {
         int skip_count = 0;  // 연속 스킵 카운터 (가비지 동기화용)
@@ -110,15 +125,28 @@ private:
 
             bitchat_packet_view_t v;
             if (!bitchat_parse(_acc_buf, _acc_len, &v)) {
-                // 파싱 실패: 데이터가 더 필요하거나 가비지
-                // 버퍼가 max 패킷 크기보다 크면 가비지로 간주하고 1바이트 스킵
-                if (_acc_len > BITCHAT_MAX_PKT_LEN) {
-                    _acc_len--;
-                    memmove(_acc_buf, _acc_buf + 1, _acc_len);
-                    skip_count++;
-                    continue;
+                // 파싱 실패. 두 가지 가능성:
+                //   (A) 정상적인 불완전 패킷 - 더 많은 데이터 필요 → 대기
+                //   (B) 가비지 - byte 0가 우연히 0x01이지만 나머지는 쓰레기 → 스킵
+                //
+                // 구분 휴리스틱: byte 1(type)이 유효한 bitchat 메시지 타입이면
+                // 정상 패킷으로 간주하고 대기. 그렇지 않으면 가비지로 1바이트 스킵.
+                //
+                // 이전 코드는 _acc_len > BITCHAT_MAX_PKT_LEN 일 때만 스킵해서
+                // 이미지 전송 후 남은 가비지가 byte 0=0x01인 경우 break 걸려
+                // 이후 오는 단문 메시지가 버퍼에 누적만 되고 추출되지 않았음.
+                uint8_t pkt_type = _acc_buf[1];
+                bool type_valid = is_valid_bitchat_type(pkt_type);
+
+                if (type_valid && _acc_len <= BITCHAT_MAX_PKT_LEN) {
+                    // 정상적인 불완전 패킷 - 더 많은 데이터 대기
+                    break;
                 }
-                break;  // 정상적으로 더 많은 데이터 필요
+                // 가비지이거나 버퍼가 너무 큼 → 1바이트 스킵 (resync)
+                _acc_len--;
+                memmove(_acc_buf, _acc_buf + 1, _acc_len);
+                skip_count++;
+                continue;
             }
 
             // total_len이 비정상적으로 크면 가비지 → 1바이트 스킵
@@ -130,14 +158,8 @@ private:
             }
 
             if (v.total_len > _acc_len) {
-                // 정상적인 불완전 패킷: 더 많은 데이터 대기
-                // 단, 버퍼가 max 패킷보다 크면 가비지로 간주
-                if (_acc_len > BITCHAT_MAX_PKT_LEN) {
-                    _acc_len--;
-                    memmove(_acc_buf, _acc_buf + 1, _acc_len);
-                    skip_count++;
-                    continue;
-                }
+                // 파싱은 성공했으나 아직 전체 패킷이 도착하지 않음 → 대기
+                // (version + type + 모든 필드가 유효하므로 정상 패킷)
                 break;
             }
 
@@ -541,23 +563,39 @@ bool BitchatRelay::verify_packet(const uint8_t* data, size_t len,
 
 bool BitchatRelay::check_dedup(const uint8_t* sender_pk, uint64_t counter,
                                 const uint8_t* payload, size_t payload_len) {
-    // key = sender_id(8) + timestamp(4) + payload_hash(4) = 16B
-    // payload_hash: 실제 payload의 첫 4바이트를 사용하여 이미지 청크 등
-    // 같은 timestamp를 공유하는 패킷도 구분 가능
-    // (이전: raw packet offset 22 사용 → recipient_id(ffffffff)로 모두 동일했음)
+    // dedup key = 16 bytes:
+    //   key[0..7]   = sender_id (8 bytes)
+    //   key[8..11]  = timestamp 상위 4 bytes
+    //   key[12..15] = timestamp 하위 4 bytes XOR payload_hash(4 bytes)
+    //
+    // payload_hash는 FNV-1a 32-bit 해시를 사용.
+    // XOR hash 대신 FNV-1a를 쓰는 이유:
+    //   - XOR hash는 같은 패턴이 반복되면 충돌 (예: "AAAA"와 "BBBB"는 다르지만
+    //     4바이트 XOR hash는 둘 다 같은 위치에 같은 길이의 패턴 → 해시가 우연히 같을 수 있음)
+    //   - FNV-1a는 각 바이트를 해시에 반영하면서 곱셈으로 확산시키므로 충돌 확률이 훨씬 낮음
+    //
+    // timestamp 하위 4 bytes와 XOR 하는 이유:
+    //   - 이전 코드는 memcpy(key+12, hash, 4)로 timestamp 하위 4 bytes를 덮어씀
+    //   - 같은 sender가 같은 내용의 메시지(예: "test")를 연속으로 보내면
+    //     timestamp 상위 4 bytes는 같고(같은 초 범위) payload_hash도 같아서
+    //     모든 메시지가 같은 key로 dedup 됨 → 2번째부터 "duplicate"로 drop됨
+    //   - XOR 하면 timestamp 하위 4 bytes의 차이가 key에 반영됨
     uint8_t key[16];
     memcpy(key, sender_pk, 8);
     for (int i = 0; i < 8; ++i) key[8 + i] = (counter >> (8*(7-i))) & 0xFF;
 
-    // payload 전체를 XOR 해시하여 4바이트 키 생성
-    // (이전: payload[0..3]만 사용 → 이미지 청크들이 앞부분이 같아 구분 불가)
-    // XOR 해시는 payload의 모든 바이트를 반영하므로 시퀀스 번호 등 차이를 감지
+    // FNV-1a 32-bit hash of payload
     if (payload && payload_len > 0) {
-        uint8_t hash[4] = {0, 0, 0, 0};
+        uint32_t h = 0x811c9dc5;  // FNV offset basis
         for (size_t i = 0; i < payload_len; ++i) {
-            hash[i & 3] ^= payload[i];
+            h ^= payload[i];
+            h *= 0x01000193;       // FNV prime
         }
-        memcpy(key + 12, hash, 4);
+        // XOR with timestamp low 4 bytes (key[12..15])
+        key[12] ^= (uint8_t)((h >> 24) & 0xFF);
+        key[13] ^= (uint8_t)((h >> 16) & 0xFF);
+        key[14] ^= (uint8_t)((h >>  8) & 0xFF);
+        key[15] ^= (uint8_t)((h      ) & 0xFF);
     }
 
     uint32_t now = millis();
