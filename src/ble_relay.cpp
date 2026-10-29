@@ -177,12 +177,10 @@ private:
             }
             _acc_len = remaining;
             // 정상 패킷은 최소 MIN_PKT_LEN(22B)이므로, 추출 후 남은 잔여물이
-            // 22바이트 미만이면 무조건 가비지(이미지 시그니처尾部 등)로 판단하여 버림.
+            // 22바이트 미만이면 무조건 가비지로 판단하여 버림.
             // → 다음 단문 패킷이 버퍼 맨 앞에서 깨끗하게 시작됨
-            // (이전: 잔여 가비지가 0x01+유효type+payload_len<=650 우연히 만족하면
-            //  "정상 incomplete"로 착각하여 break → 이후 단문이 막힘)
             if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
-                LOGD("BLE acc: discarded %d small leftover bytes (< MIN_PKT_LEN)", (int)_acc_len);
+                LOGD("BLE acc: discarded %d small leftover bytes", (int)_acc_len);
                 _acc_len = 0;
             }
         }
@@ -399,7 +397,19 @@ void BitchatRelay::loop() {
     if (millis() - last_maint > 500) {
         last_maint = millis();
         maintain_connections();
-        scan_cycle();
+        // 폰(incoming client)이 연결되어 있으면 scan 금지
+        // → 스캔이 다른 bitchat 노드를 발견하고 연결 시도하면
+        //   BLE 컨트롤러가 30초간 점유되어 폰의 단문 수신이 막힘
+        // 폰이 연결된 상태에서는 폰 통신을 최우선으로 보장
+        if (_incoming_count > 0) {
+            // scan 중이면 중지
+            if (_scan_active) {
+                _scan->stop();
+                _scan_active = false;
+            }
+        } else {
+            scan_cycle();
+        }
     }
 
     // Store-and-forward: 클라이언트 접속 시 캐시된 메시지 전송
@@ -755,7 +765,10 @@ bool BitchatRelay::connect_to_peer(NimBLEAddress addr) {
 
     NimBLEClient* client = NimBLEDevice::createClient();
     client->setClientCallbacks(new BitchatClientCallbacks(this));
-    LOGI("connecting to peer %s ...", std::string(addr).c_str());
+    // 연결 타임아웃 3초로 단축 (기본 30초 → 3초)
+    // 긴 타임아웃은 BLE 컨트롤러를 점유하여 폰의 단문 수신을 30초간 막음
+    client->setConnectTimeout(3);    // 3 seconds (NimBLE 1.4.2: uint8_t 단위 = 초)
+    LOGI("connecting to peer %s (timeout=3s) ...", std::string(addr).c_str());
     if (!client->connect(addr)) {
         LOGW("connect failed to %s", std::string(addr).c_str());
         NimBLEDevice::deleteClient(client);
