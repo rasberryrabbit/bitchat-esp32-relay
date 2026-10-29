@@ -113,6 +113,26 @@ private:
 
     // 누적 버퍼에서 완전한 패킷 추출 (0개 이상 추출 가능)
     void extract_packets() {
+        // === Stale head discard (v8) ===
+        // 버퍼의 가장 오래된 바이트(head)의 나이를 추적.
+        // 정상 incomplete 패킷(이미지 청크 등)은 BLE burst로 30~90ms 내 완성됨.
+        // head가 5초 이상 경과했으면 가비지(이미지 시그니처尾部 등)로 판단하여
+        // 버퍼 전체를 폐기 → 다음 패킷이 깨끗한 버퍼에서 시작됨.
+        // (v7의 "버퍼 커짐=가비지" 가정은 정상 incomplete도 버퍼를 키우므로 오류.
+        //  v8은 시간 기반이므로 정상 패킷에 영향 없음.)
+        static uint32_t head_ms = 0;   // 0 = 버퍼 비어있음 또는 head 초기화됨
+        if (_acc_len == 0) {
+            head_ms = 0;
+        } else if (head_ms == 0) {
+            head_ms = millis();        // 빈 버퍼에 데이터가 처음 들어옴
+        } else if (millis() - head_ms > 5000) {
+            LOGW("BLE acc: stale buffer discarded (%u bytes, head age %lums)",
+                 (unsigned)_acc_len,
+                 (unsigned long)(millis() - head_ms));
+            _acc_len = 0;
+            head_ms = 0;
+        }
+
         int skip_count = 0;  // 연속 스킵 카운터 (가비지 동기화용)
         while (_acc_len >= BITCHAT_MIN_PKT_LEN) {
             uint8_t ver = _acc_buf[0];
@@ -174,6 +194,9 @@ private:
             size_t remaining = _acc_len - v.total_len;
             if (remaining > 0) {
                 memmove(_acc_buf, _acc_buf + v.total_len, remaining);
+                // head가 이동함. remaining은 최근 데이터이므로 head_ms 갱신
+                // (보수적: age를 과소평가 → stale 판정이 늦어질 뿐, 안전)
+                head_ms = millis();
             }
             _acc_len = remaining;
             // 정상 패킷은 최소 MIN_PKT_LEN(22B)이므로, 추출 후 남은 잔여물이
@@ -182,6 +205,7 @@ private:
             if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
                 LOGD("BLE acc: discarded %d small leftover bytes", (int)_acc_len);
                 _acc_len = 0;
+                head_ms = 0;
             }
         }
         if (skip_count > 0) {
@@ -195,6 +219,7 @@ private:
         if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
             LOGD("BLE acc: discarded %d small leftover bytes (post-loop)", (int)_acc_len);
             _acc_len = 0;
+            head_ms = 0;
         }
     }
 };
