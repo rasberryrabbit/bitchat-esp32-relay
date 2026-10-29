@@ -52,20 +52,113 @@ private:
 // ============================================================================
 // RX characteristic callbacks (clients write to us)
 // ============================================================================
+// BLE write accumulator: 큰 패킷(이미지 등)이 여러 BLE write로 분할되어
+// 전송되는 것을 누적하여 완전한 패킷으로 조립 후 처리
+// 2개 패킷 분량 확보 (연속으로 오는 패킷 처리용)
+#define BLE_ACC_BUF_SIZE  (2 * BITCHAT_MAX_PKT_LEN + 128)  // 2*808 + 128 = 1744B
+
 class BitchatRXCallbacks : public NimBLECharacteristicCallbacks {
 public:
-    BitchatRXCallbacks(BitchatRelay* r) : _r(r) {}
-    // NimBLE 1.4.2: onWrite 단일 인자
+    BitchatRXCallbacks(BitchatRelay* r) : _r(r), _acc_len(0) {}
+
     void onWrite(NimBLECharacteristic* ch) override {
         NimBLEAttValue val = ch->getValue();
         if (val.size() == 0) return;
         const uint8_t* data = val.data();
         size_t len = val.size();
         LOGD("RX write: %u bytes", (unsigned)len);
-        _r->enqueue_packet(data, len, BC_SRC_SERVER_RX, 0xFFFF);
+
+        if (len > BLE_ACC_BUF_SIZE) {
+            _r->enqueue_packet(data, len, BC_SRC_SERVER_RX, 0xFFFF);
+            return;
+        }
+
+        // 0) 새 데이터 추가 전에 기존 버퍼에서 완전한 패킷 추출 (공간 확보)
+        //    이 단계가 없으면 2개 패킷이 버퍼에 쌓였을 때 overflow 발생
+        extract_packets();
+
+        // 1) 새 데이터 추가
+        if (_acc_len + len > BLE_ACC_BUF_SIZE) {
+            // 추출 후에도 공간 부족 → 버퍼 리셋 (비정상 상황)
+            LOGW("BLE acc: overflow (%u+%u > %u) after extraction, resetting",
+                 (unsigned)_acc_len, (unsigned)len, BLE_ACC_BUF_SIZE);
+            _acc_len = 0;
+        }
+        memcpy(_acc_buf + _acc_len, data, len);
+        _acc_len += len;
+
+        // 2) 새 데이터 추가 후 다시 추출 시도
+        extract_packets();
     }
+
 private:
     BitchatRelay* _r;
+    uint8_t _acc_buf[BLE_ACC_BUF_SIZE];
+    size_t _acc_len;
+
+    // 누적 버퍼에서 완전한 패킷 추출 (0개 이상 추출 가능)
+    void extract_packets() {
+        int skip_count = 0;  // 연속 스킵 카운터 (가비지 동기화용)
+        while (_acc_len >= BITCHAT_MIN_PKT_LEN) {
+            uint8_t ver = _acc_buf[0];
+            if (ver != BITCHAT_VERSION_1 && ver != BITCHAT_VERSION_2) {
+                _acc_len--;
+                memmove(_acc_buf, _acc_buf + 1, _acc_len);
+                skip_count++;
+                continue;
+            }
+
+            bitchat_packet_view_t v;
+            if (!bitchat_parse(_acc_buf, _acc_len, &v)) {
+                // 파싱 실패: 데이터가 더 필요하거나 가비지
+                // 버퍼가 max 패킷 크기보다 크면 가비지로 간주하고 1바이트 스킵
+                if (_acc_len > BITCHAT_MAX_PKT_LEN) {
+                    _acc_len--;
+                    memmove(_acc_buf, _acc_buf + 1, _acc_len);
+                    skip_count++;
+                    continue;
+                }
+                break;  // 정상적으로 더 많은 데이터 필요
+            }
+
+            // total_len이 비정상적으로 크면 가비지 → 1바이트 스킵
+            if (v.total_len > BITCHAT_MAX_PKT_LEN) {
+                _acc_len--;
+                memmove(_acc_buf, _acc_buf + 1, _acc_len);
+                skip_count++;
+                continue;
+            }
+
+            if (v.total_len > _acc_len) {
+                // 정상적인 불완전 패킷: 더 많은 데이터 대기
+                // 단, 버퍼가 max 패킷보다 크면 가비지로 간주
+                if (_acc_len > BITCHAT_MAX_PKT_LEN) {
+                    _acc_len--;
+                    memmove(_acc_buf, _acc_buf + 1, _acc_len);
+                    skip_count++;
+                    continue;
+                }
+                break;
+            }
+
+            // 완전한 패킷!
+            if (skip_count > 0) {
+                LOGD("BLE acc: skipped %d garbage bytes before packet", skip_count);
+                skip_count = 0;
+            }
+            LOGD("BLE acc: complete packet %uB extracted", (unsigned)v.total_len);
+            _r->enqueue_packet(_acc_buf, v.total_len, BC_SRC_SERVER_RX, 0xFFFF);
+
+            size_t remaining = _acc_len - v.total_len;
+            if (remaining > 0) {
+                memmove(_acc_buf, _acc_buf + v.total_len, remaining);
+            }
+            _acc_len = remaining;
+        }
+        if (skip_count > 0) {
+            LOGD("BLE acc: skipped %d garbage bytes (no complete packet found)", skip_count);
+        }
+    }
 };
 
 // ============================================================================
@@ -289,7 +382,22 @@ void BitchatRelay::loop() {
             static NimBLECharacteristic* s_flush_char = nullptr;
             s_flush_char = _char;
             msg_cache_flush([](const uint8_t* d, size_t l) {
-                if (s_flush_char) { s_flush_char->setValue(d, l); s_flush_char->notify(); }
+                if (s_flush_char) {
+                    // BLE MTU 244B 제한: 큰 패킷은 청크 분할
+                    if (l <= 244) {
+                        s_flush_char->setValue(d, l);
+                        s_flush_char->notify();
+                    } else {
+                        size_t off = 0;
+                        while (off < l) {
+                            size_t cl = (l - off > 244) ? 244 : (l - off);
+                            s_flush_char->setValue(d + off, cl);
+                            s_flush_char->notify();
+                            off += cl;
+                            if (off < l) delay(2);
+                        }
+                    }
+                }
             });
             s_flush_char = nullptr;
         }
@@ -389,7 +497,11 @@ void BitchatRelay::process_packet(bitchat_pkt_event_t* evt) {
         }
     }
 
-    if (check_dedup(v.sender_id, v.timestamp)) {
+    // Dedup: use parsed payload pointer (not raw offset) for accurate chunk distinction
+    // v.payload points to actual payload content (after header + sender_id + recipient_id)
+    // This correctly distinguishes image chunks that share the same sender_id + timestamp
+    if (check_dedup(v.sender_id, v.timestamp,
+                    reinterpret_cast<const uint8_t*>(v.payload), v.payload_len)) {
         LOGD("duplicate packet, dropping");
         return;
     }
@@ -427,10 +539,26 @@ bool BitchatRelay::verify_packet(const uint8_t* data, size_t len,
     return bitchat_parse(data, len, view);
 }
 
-bool BitchatRelay::check_dedup(const uint8_t* sender_pk, uint64_t counter) {
+bool BitchatRelay::check_dedup(const uint8_t* sender_pk, uint64_t counter,
+                                const uint8_t* payload, size_t payload_len) {
+    // key = sender_id(8) + timestamp(4) + payload_hash(4) = 16B
+    // payload_hash: 실제 payload의 첫 4바이트를 사용하여 이미지 청크 등
+    // 같은 timestamp를 공유하는 패킷도 구분 가능
+    // (이전: raw packet offset 22 사용 → recipient_id(ffffffff)로 모두 동일했음)
     uint8_t key[16];
     memcpy(key, sender_pk, 8);
     for (int i = 0; i < 8; ++i) key[8 + i] = (counter >> (8*(7-i))) & 0xFF;
+
+    // payload 전체를 XOR 해시하여 4바이트 키 생성
+    // (이전: payload[0..3]만 사용 → 이미지 청크들이 앞부분이 같아 구분 불가)
+    // XOR 해시는 payload의 모든 바이트를 반영하므로 시퀀스 번호 등 차이를 감지
+    if (payload && payload_len > 0) {
+        uint8_t hash[4] = {0, 0, 0, 0};
+        for (size_t i = 0; i < payload_len; ++i) {
+            hash[i & 3] ^= payload[i];
+        }
+        memcpy(key + 12, hash, 4);
+    }
 
     uint32_t now = millis();
     for (int i = 0; i < BC_DEDUP_CACHE_SIZE; ++i) {
@@ -463,9 +591,27 @@ void BitchatRelay::forward_to_others(const uint8_t* data, size_t len,
     }
 
     // 1) 모든 incoming clients에게 notify
+    //    BLE MTU 제한 (244 bytes) 때문에 큰 패킷은 청크로 분할 전송
+    //    수신측(bitchat 앱)이 BLE notify를 누적하여 재조립해야 함
     if (_char) {
-        _char->setValue(data, len);
-        _char->notify();
+        if (len <= 244) {
+            // 작은 패킷은 그대로 notify
+            _char->setValue(data, len);
+            _char->notify();
+        } else {
+            // 큰 패킷은 244바이트 청크로 분할
+            size_t offset = 0;
+            while (offset < len) {
+                size_t chunk_len = (len - offset > 244) ? 244 : (len - offset);
+                _char->setValue(data + offset, chunk_len);
+                _char->notify();
+                offset += chunk_len;
+                // 청크 간 미세 delay (BLE 스택이 처리할 시간 확보)
+                if (offset < len) delay(2);
+            }
+            LOGD("forwarded %uB in %u chunks (BLE notify split)", (unsigned)len,
+                 (unsigned)((len + 243) / 244));
+        }
     }
     // Store-and-forward: 연결된 클라이언트가 없으면 MESSAGE 캐시에 저장
     if (_incoming_count == 0) {

@@ -61,10 +61,11 @@
 #define BC_DEDUP_CACHE_SIZE   64
 
 // 패킷 수신 큐 길이 (FreeRTOS queue)
+// 이미지 전송 시 여러 패킷이 연속으로 들어올 수 있으므로 여유 있게 설정
 #ifdef BOARD_VARIANT_ESP32C3
-#define BC_PKT_QUEUE_LEN      12   // C3 + NimBLE: 8 → 12 (heap 여유)
+#define BC_PKT_QUEUE_LEN      24   // C3: 12 → 24 (이미지 대응)
 #else
-#define BC_PKT_QUEUE_LEN      16
+#define BC_PKT_QUEUE_LEN      32   // classic/S3: 16 → 32 (이미지 대응)
 #endif
 
 // 패킷 출처 (어느 링크로 들어왔는지)
@@ -139,7 +140,8 @@ private:
     void process_packet(bitchat_pkt_event_t* evt);
     bool verify_packet(const uint8_t* data, size_t len,
                        bitchat_packet_view_t* view);
-    bool check_dedup(const uint8_t* sender_pk, uint64_t counter);
+    bool check_dedup(const uint8_t* sender_pk, uint64_t counter,
+                     const uint8_t* payload = nullptr, size_t payload_len = 0);
     void forward_to_others(const uint8_t* data, size_t len, uint16_t except_conn);
     void forward_to_peer(PeerEntry* p, const uint8_t* data, size_t len);
     void scan_cycle();
