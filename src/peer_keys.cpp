@@ -39,7 +39,10 @@ typedef struct {
     uint8_t  key_mask;                     // bit 0: pk[0] valid, bit 1: pk[1] valid
 } peer_key_entry_t;
 
-static peer_key_entry_t g_entries[BC_PEER_KEY_MAX_ENTRIES];
+// 128개 × 74B = 9,472B. 정적 .bss에 넣으면 dram0_0_seg overflow 발생.
+// 따라서 heap (calloc)으로 동적 할당 → 정적 세그먼트 부담 0, heap에서 9.5KB 사용.
+// ESP32 heap은 보통 200+KB이므로 충분한 여유.
+static peer_key_entry_t* g_entries = nullptr;  // peer_keys_init()에서 calloc
 static bool g_init = false;
 
 // SPIFFS에 전체 매핑 저장 (덮어쓰기)
@@ -58,6 +61,9 @@ static void persist_to_spiffs(void) {
 }
 
 // SPIFFS에서 로드
+// 하위 호환: 32-entry 파일(2,368B) → 128-entry 버퍼(9,472B)에 로드 시
+//   got=2,368 < sizeof(g_entries)=9,472 → warning + 나머지 zero padding
+//   기존 32개 매핑은 정상 로드, 나머지 96개는 inactive(0)로 시작
 static bool load_from_spiffs(void) {
     if (!SPIFFS.exists(BC_PEER_KEYS_FILE)) {
         return false;
@@ -70,7 +76,8 @@ static bool load_from_spiffs(void) {
     size_t got = f.readBytes((char*)g_entries, sizeof(g_entries));
     f.close();
     if (got != sizeof(g_entries)) {
-        LOGW("peer_keys: file truncated (%u/%u), padding zeros",
+        // 32-entry → 128-entry 업그레이드 시 발생 (정상 동작)
+        LOGW("peer_keys: file size %uB < expected %uB (likely 32-entry upgrade), padding zeros",
              (unsigned)got, (unsigned)sizeof(g_entries));
         if (got < sizeof(g_entries)) {
             memset((uint8_t*)g_entries + got, 0, sizeof(g_entries) - got);
@@ -80,6 +87,9 @@ static bool load_from_spiffs(void) {
 }
 
 // NVS에서 로드 (구버전 호환 - 마이그레이션 시 사용)
+// 하위 호환: 32-entry blob(2,368B) → 128-entry 버퍼(9,472B)에 로드 시
+//   peer_keys_init에서 memset으로 zero 초기화 선행 → NVS blob이 처음 2,368B만 채우고
+//   나머지 7,104B는 그대로 0 (inactive) → 정상 동작
 static bool load_from_nvs(void) {
     nvs_handle_t h;
     if (nvs_open(BC_PK_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
@@ -103,7 +113,23 @@ static void erase_nvs_keys(void) {
 
 bool peer_keys_init(void) {
     if (g_init) return true;
-    memset(g_entries, 0, sizeof(g_entries));
+
+    // Heap에서 g_entries 동적 할당 (정적 .bss 부담 피하기)
+    // - 128 entries × 74B = 9,472B
+    // - calloc이 0으로 초기화하므로 모든 entry가 inactive 상태로 시작
+    if (!g_entries) {
+        g_entries = (peer_key_entry_t*)calloc(BC_PEER_KEY_MAX_ENTRIES,
+                                              sizeof(peer_key_entry_t));
+        if (!g_entries) {
+            LOGE("peer_keys: failed to allocate %uB heap for %u entries",
+                 (unsigned)(BC_PEER_KEY_MAX_ENTRIES * sizeof(peer_key_entry_t)),
+                 BC_PEER_KEY_MAX_ENTRIES);
+            return false;
+        }
+        LOGI("peer_keys: allocated %uB heap for %u entries",
+             (unsigned)(BC_PEER_KEY_MAX_ENTRIES * sizeof(peer_key_entry_t)),
+             BC_PEER_KEY_MAX_ENTRIES);
+    }
 
     // SPIFFS 마운트는 main.cpp setup()에서 선행됨
     if (!SPIFFS.begin(true)) {

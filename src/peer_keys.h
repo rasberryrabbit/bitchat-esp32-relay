@@ -8,13 +8,14 @@
  *
  *   저장 백엔드: SPIFFS 파일 /peer_keys.bin (이전에는 NVS blob 사용)
  *     - 단일 파일, 고정 크기 레코드
- *     - 32개 매핑 × (1+8+64+1) = 32 × 74B = 2,368B
- *     - 부팅 시 1회 로드 → RAM 캐시, 이후 빠른 조회
+ *     - 128개 매핑 × (1+8+64+1) = 128 × 74B = 9,472B
+ *     - 부팅 시 1회 로드 → RAM 캐시 (9.5KB 상주), 이후 빠른 조회
  *
  *   SPIFFS 전환 이유:
- *     - NVS blob 한계 (~4KB) → 32개가 최대
+ *     - NVS blob 한계 (~4KB) → 32개가 최대였음
  *     - NVS namespace "bpkey" → SPIFFS로 1회 자동 마이그레이션
  *     - 파일 단위 저장 → 다른 설정 (node.conf, wifi.conf)과 일관성
+ *     - 128개 확장: SPIFFS 전환 후 NVS blob 한계 해소, RAM 9.5KB 상주
  *
  *   Serial 명령 (main.cpp):
  *     peer list        - 현재 매핑 dump
@@ -31,7 +32,7 @@
 extern "C" {
 #endif
 
-#define BC_PEER_KEY_MAX_ENTRIES  32
+#define BC_PEER_KEY_MAX_ENTRIES  128
 #define BC_PEER_KEY_ID_SIZE       8
 #define BC_PEER_KEY_PK_SIZE       32
 

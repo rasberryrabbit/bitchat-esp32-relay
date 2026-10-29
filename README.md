@@ -719,7 +719,7 @@ rst:0x5 (DEEPSLEEP_RESET), boot:0x13 (SPI_FAST_FLASH_BOOT)
 | 항목 | 이전 (NVS) | 현재 (SPIFFS) |
 |------|-----------|----------------|
 | 파일/namespace | `bpkey/keys` blob | `/peer_keys.bin` 파일 |
-| 용량 | ~2.4KB blob | 2,368B (32개 × 74B) |
+| 용량 | ~2.4KB blob | 9,472B (128개 × 74B) |
 | 부팅 시 동작 | NVS blob 로드 | SPIFFS 로드, NVS 마이그레이션(1회) |
 | 장점 | (이전) | 다른 설정(node.conf, wifi.conf)과 일관된 관리 |
 
@@ -955,13 +955,14 @@ mTLS로 MQTT 브로커 연결 보안은 확보했지만, BLE 메시 네트워크
 
 > 파티션 테이블 `partitions/no_ota_spiffs_1mb.csv` 적용 기준 (app0=2,848KB, SPIFFS=1,024KB)
 
-| 보드 | RAM | Flash | app0 사용률 | 비고 |
-|------|-----|-------|-------------|------|
-| ESP32 클래식 | 37.3% (122KB) | 1,248KB | **43.8%** (app0 2,848KB) | OTA 제거로 2.22배 여유 |
-| ESP32-C3 | 34.4% (113KB) | 1,221KB | **42.9%** (app0 2,848KB) | OTA 제거로 2.22배 여유 |
-| ESP32-S3 | 36.5% (119KB) | 1,139KB | **40.0%** (app0 2,848KB) | 가장 여유 (8MB Flash) |
+| 보드 | RAM (static) | Flash | app0 사용률 | 비고 |
+|------|-------------|-------|-------------|------|
+| ESP32 클래식 | 37.0% (121KB) | 1,405KB | **49.3%** (app0 2,848KB) | mTLS + 128 peer_keys (heap 9.5KB) |
+| ESP32-C3 | 33-34% (~110KB) | 1,384KB | **48.6%** (app0 2,848KB) | 동일 |
+| ESP32-S3 | 36% (~119KB) | 1,292KB | **45.3%** (app0 2,848KB) | 가장 여유 (8MB Flash) |
 
-이전 (default.csv, app0=1,280KB) 대비 app0 여유 약 2.7배 확보 + SPIFFS 1MB 추가.
+> peer_keys 128개 엔트리는 heap 동적 할당 (calloc)으로 처리하여 정적 .bss 부담 0.
+> 부팅 시 9.5KB heap 사용 → ESP32 heap 200+KB 중 5% 미만.
 
 ---
 
@@ -1247,7 +1248,7 @@ bitchat-esp32-relay/
 │   ├── msg_cache.h/.cpp          # store-and-forward RAM 캐시 (32 entries, 12h TTL)
 │   ├── msg_store.h/.cpp          # SPIFFS overflow backend (3072 entries, /msg_store.bin)
 │   ├── node_config.h/.cpp        # SPIFFS config files (/node.conf, /wifi.conf)
-│   ├── peer_keys.h/.cpp          # senderID → Ed25519 pk 매핑 (SPIFFS /peer_keys.bin)
+│   ├── peer_keys.h/.cpp          # senderID → Ed25519 pk 매핑 (128 entries, SPIFFS /peer_keys.bin, heap allocated)
 │   ├── wifi_bridge.h/.cpp         # WiFi+MQTT 브릿지 (BLE↔인터넷, Serial on/off)
 │   └── ble_relay.h/.cpp           # BLE GATT + relay (NimBLE, 배터리 모드 시 저듀티)
 ├── lib/                           # 외부 라이브러리 (자체 포함)
