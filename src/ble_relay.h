@@ -109,7 +109,6 @@ private:
     volatile int      _outgoing_count;
     bool               _scan_active;
     uint32_t           _last_connect_ms;   // store-and-forward flush 2초 지연용
-    volatile uint32_t  _last_rx_ms;        // 마지막 패킷 수신 시각 (scan/connect 억제용)
 
     struct PeerEntry {
         uint8_t  addr[6];

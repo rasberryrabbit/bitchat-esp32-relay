@@ -176,6 +176,15 @@ private:
                 memmove(_acc_buf, _acc_buf + v.total_len, remaining);
             }
             _acc_len = remaining;
+            // 정상 패킷은 최소 MIN_PKT_LEN(22B)이므로, 추출 후 남은 잔여물이
+            // 22바이트 미만이면 무조건 가비지(이미지 시그니처尾部 등)로 판단하여 버림.
+            // → 다음 단문 패킷이 버퍼 맨 앞에서 깨끗하게 시작됨
+            // (이전: 잔여 가비지가 0x01+유효type+payload_len<=650 우연히 만족하면
+            //  "정상 incomplete"로 착각하여 break → 이후 단문이 막힘)
+            if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
+                LOGD("BLE acc: discarded %d small leftover bytes (< MIN_PKT_LEN)", (int)_acc_len);
+                _acc_len = 0;
+            }
         }
         if (skip_count > 0) {
             LOGD("BLE acc: skipped %d garbage bytes (no complete packet found)", skip_count);
@@ -270,7 +279,7 @@ BitchatRelay::BitchatRelay()
       _char(nullptr), _advertising(nullptr),
       _scan(nullptr), _pkt_queue(nullptr), _scan_active(false),
       _incoming_count(0), _outgoing_count(0),
-      _last_connect_ms(0), _last_rx_ms(0),
+      _last_connect_ms(0),
       _peer_slot_count(0), _dedup_idx(0) {
     memset(_peers, 0, sizeof(_peers));
     memset(_dedup, 0, sizeof(_dedup));
@@ -357,7 +366,6 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
 void BitchatRelay::enqueue_packet(const uint8_t* data, size_t len,
                                    BitchatPktSource src, uint16_t conn_id) {
     if (!data || len == 0 || len > BITCHAT_MAX_PKT_LEN) return;
-    _last_rx_ms = millis();   // 패킷 수신 시각 기록 (scan/connect 억제용)
     bitchat_pkt_event_t evt;
     memcpy(evt.data, data, len);
     evt.len = len;
@@ -391,13 +399,7 @@ void BitchatRelay::loop() {
     if (millis() - last_maint > 500) {
         last_maint = millis();
         maintain_connections();
-        // 패킷 수신 후 3초 이내에는 scan 금지
-        // → BLE 컨트롤러가 scan/connect에 점유되어 폰의 단문 수신이 막히는 현상 방지
-        if (_last_rx_ms > 0 && (millis() - _last_rx_ms < 3000)) {
-            // 데이터 활동 중: scan 스킵
-        } else {
-            scan_cycle();
-        }
+        scan_cycle();
     }
 
     // Store-and-forward: 클라이언트 접속 시 캐시된 메시지 전송
@@ -753,10 +755,7 @@ bool BitchatRelay::connect_to_peer(NimBLEAddress addr) {
 
     NimBLEClient* client = NimBLEDevice::createClient();
     client->setClientCallbacks(new BitchatClientCallbacks(this));
-    // 연결 타임아웃 3초로 단축 (기본 30초 → 3초)
-    // 긴 타임아웃은 BLE 컨트롤러를 점유하여 폰의 단문 수신을 30초간 막음
-    client->setConnectTimeout(3);   // 3 seconds (NimBLE units = seconds)
-    LOGI("connecting to peer %s (timeout=3s) ...", std::string(addr).c_str());
+    LOGI("connecting to peer %s ...", std::string(addr).c_str());
     if (!client->connect(addr)) {
         LOGW("connect failed to %s", std::string(addr).c_str());
         NimBLEDevice::deleteClient(client);
