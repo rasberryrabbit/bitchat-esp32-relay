@@ -42,8 +42,15 @@ typedef struct {
 // 128개 × 74B = 9,472B. 정적 .bss에 넣으면 dram0_0_seg overflow 발생.
 // 따라서 heap (calloc)으로 동적 할당 → 정적 세그먼트 부담 0, heap에서 9.5KB 사용.
 // ESP32 heap은 보통 200+KB이므로 충분한 여유.
+//
+// 주의: g_entries가 포인터이므로 sizeof(g_entries) == 4 (포인터 크기).
+// 절대 sizeof(g_entries)를 쓰지 말고 G_ENTRIES_BYTES를 사용할 것!
 static peer_key_entry_t* g_entries = nullptr;  // peer_keys_init()에서 calloc
 static bool g_init = false;
+
+// g_entries 전체 버퍼 크기 (sizeof(g_entries) 대신 사용)
+// sizeof(pointer) == 4 이므로 포인터에 sizeof를 쓰면 치명적 버그 발생
+#define G_ENTRIES_BYTES ((size_t)(BC_PEER_KEY_MAX_ENTRIES * sizeof(peer_key_entry_t)))
 
 // SPIFFS에 전체 매핑 저장 (덮어쓰기)
 static void persist_to_spiffs(void) {
@@ -52,17 +59,17 @@ static void persist_to_spiffs(void) {
         LOGE("peer_keys: open(%s, w) failed", BC_PEER_KEYS_FILE);
         return;
     }
-    size_t written = f.write((const uint8_t*)g_entries, sizeof(g_entries));
+    size_t written = f.write((const uint8_t*)g_entries, G_ENTRIES_BYTES);
     f.close();
-    if (written != sizeof(g_entries)) {
+    if (written != G_ENTRIES_BYTES) {
         LOGE("peer_keys: write short %u/%u",
-             (unsigned)written, (unsigned)sizeof(g_entries));
+             (unsigned)written, (unsigned)G_ENTRIES_BYTES);
     }
 }
 
 // SPIFFS에서 로드
 // 하위 호환: 32-entry 파일(2,368B) → 128-entry 버퍼(9,472B)에 로드 시
-//   got=2,368 < sizeof(g_entries)=9,472 → warning + 나머지 zero padding
+//   got=2,368 < G_ENTRIES_BYTES=9,472 → warning + 나머지 zero padding
 //   기존 32개 매핑은 정상 로드, 나머지 96개는 inactive(0)로 시작
 static bool load_from_spiffs(void) {
     if (!SPIFFS.exists(BC_PEER_KEYS_FILE)) {
@@ -73,14 +80,14 @@ static bool load_from_spiffs(void) {
         LOGE("peer_keys: open(%s, r) failed", BC_PEER_KEYS_FILE);
         return false;
     }
-    size_t got = f.readBytes((char*)g_entries, sizeof(g_entries));
+    size_t got = f.readBytes((char*)g_entries, G_ENTRIES_BYTES);
     f.close();
-    if (got != sizeof(g_entries)) {
+    if (got != G_ENTRIES_BYTES) {
         // 32-entry → 128-entry 업그레이드 시 발생 (정상 동작)
         LOGW("peer_keys: file size %uB < expected %uB (likely 32-entry upgrade), padding zeros",
-             (unsigned)got, (unsigned)sizeof(g_entries));
-        if (got < sizeof(g_entries)) {
-            memset((uint8_t*)g_entries + got, 0, sizeof(g_entries) - got);
+             (unsigned)got, (unsigned)G_ENTRIES_BYTES);
+        if (got < G_ENTRIES_BYTES) {
+            memset((uint8_t*)g_entries + got, 0, G_ENTRIES_BYTES - got);
         }
     }
     return true;
@@ -95,7 +102,7 @@ static bool load_from_nvs(void) {
     if (nvs_open(BC_PK_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
         return false;
     }
-    size_t sz = sizeof(g_entries);
+    size_t sz = G_ENTRIES_BYTES;
     bool ok = (nvs_get_blob(h, BC_PK_NVS_KEY, g_entries, &sz) == ESP_OK);
     nvs_close(h);
     return ok;
@@ -163,7 +170,7 @@ bool peer_keys_init(void) {
     g_init = true;
     LOGI("peer_keys: initialized (file=%s, %u active/%u max, %uB file)",
          BC_PEER_KEYS_FILE, (unsigned)count, BC_PEER_KEY_MAX_ENTRIES,
-         (unsigned)sizeof(g_entries));
+         (unsigned)G_ENTRIES_BYTES);
     return true;
 }
 
@@ -234,7 +241,7 @@ size_t peer_keys_count(void) {
 }
 
 void peer_keys_clear(void) {
-    memset(g_entries, 0, sizeof(g_entries));
+    memset(g_entries, 0, G_ENTRIES_BYTES);
     SPIFFS.remove(BC_PEER_KEYS_FILE);
     LOGI("peer_keys: cleared all (SPIFFS file removed)");
 }
@@ -243,7 +250,7 @@ void peer_keys_debug_dump(void) {
     if (!g_init) return;
     size_t count = peer_keys_count();
     LOGI("=== peer_keys: %u mappings (SPIFFS /peer_keys.bin, %uB) ===",
-         (unsigned)count, (unsigned)sizeof(g_entries));
+         (unsigned)count, (unsigned)G_ENTRIES_BYTES);
     for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
         if (!g_entries[i].active) continue;
         char id[17];
