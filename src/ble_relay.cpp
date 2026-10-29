@@ -187,6 +187,15 @@ private:
         if (skip_count > 0) {
             LOGD("BLE acc: skipped %d garbage bytes (no complete packet found)", skip_count);
         }
+        // while 루프 종료 후 (break로 빠져나온 경우) 남은 잔여물 처리
+        // 패킷 추출 후의 discard는 위에서 처리하지만, break로 종료 시에는
+        // 여기서 처리해야 함. while 루프가 break로 종료되면 버퍼에
+        // 가비지가 남아 다음 단문 패킷 추출을 막음.
+        // 정상 패킷은 최소 22바이트이므로 22바이트 미만 잔여물은 가비지.
+        if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
+            LOGD("BLE acc: discarded %d small leftover bytes (post-loop)", (int)_acc_len);
+            _acc_len = 0;
+        }
     }
 };
 
