@@ -71,6 +71,10 @@ static void persist_to_spiffs(void) {
 // 하위 호환: 32-entry 파일(2,368B) → 128-entry 버퍼(9,472B)에 로드 시
 //   got=2,368 < G_ENTRIES_BYTES=9,472 → warning + 나머지 zero padding
 //   기존 32개 매핑은 정상 로드, 나머지 96개는 inactive(0)로 시작
+//
+// 손상 감지: 파일 크기가 1 entry(74B)보다 작으면 corrupt로 간주
+//   → sizeof 버그로 4 bytes만 기록된 파일 등
+//   → false 반환 → peer_keys_init에서 NVS 마이그레이션 경로로 진입
 static bool load_from_spiffs(void) {
     if (!SPIFFS.exists(BC_PEER_KEYS_FILE)) {
         return false;
@@ -80,6 +84,18 @@ static bool load_from_spiffs(void) {
         LOGE("peer_keys: open(%s, r) failed", BC_PEER_KEYS_FILE);
         return false;
     }
+
+    // 파일 크기 검증: 최소 1 entry (74 bytes) 보다 작으면 corrupt
+    size_t file_size = f.size();
+    if (file_size < sizeof(peer_key_entry_t)) {
+        LOGW("peer_keys: file too small (%uB < %uB), treating as corrupt → try NVS migration",
+             (unsigned)file_size, (unsigned)sizeof(peer_key_entry_t));
+        f.close();
+        // 손상된 파일 삭제 → 다음 부팅 시 NVS에서 정상 데이터 마이그레이션
+        SPIFFS.remove(BC_PEER_KEYS_FILE);
+        return false;
+    }
+
     size_t got = f.readBytes((char*)g_entries, G_ENTRIES_BYTES);
     f.close();
     if (got != G_ENTRIES_BYTES) {

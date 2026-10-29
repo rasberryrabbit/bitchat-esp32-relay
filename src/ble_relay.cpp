@@ -19,7 +19,6 @@
 #include "wifi_bridge.h"
 #include "peer_keys.h"   // senderID → Ed25519 pk 매핑
 #include "msg_cache.h"    // store-and-forward 메시지 캐시
-#include "node_config.h"  // nickname → BLE adv name
 
 #include <cstring>
 #include <algorithm>
@@ -77,7 +76,7 @@ public:
     BitchatAdvertisedCallbacks(BitchatRelay* r) : _r(r) {}
     // NimBLE은 onResult가 pointer 인자로 전달
     void onResult(NimBLEAdvertisedDevice* dev) override {
-        // 우리 서비스 UUID가 advertise 되어 있으면 bitchat 노드로 간주
+        // Service UUID가 광고되어 있으면 bitchat 노드로 간주
         if (!dev->isAdvertisingService(NimBLEUUID(BC_BLE_SERVICE_UUID))) {
             return;
         }
@@ -181,14 +180,11 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     }
 
     // NimBLE 디바이스 초기화
-    // nickname이 설정되어 있으면 "bitchat-<nick>" 형식으로 광고
-    // 그렇지 않으면 기본 "bitchat"
-    char adv_name[8 + MAX_NICKNAME_LEN + 1] = "bitchat";
-    const char* nick = node_config_get_nickname();
-    if (nick && nick[0]) {
-        snprintf(adv_name, sizeof(adv_name), "bitchat-%s", nick);
-    }
-    NimBLEDevice::init(adv_name);
+    // BLE 이름은 항상 "bitchat" (고정)
+    //   - 광고 패킷(31B)에 UUID(18B) + "bitchat"(9B) + flags(3B) = 30B ≤ 31B
+    //   - 닉네임이 있으면 "bitchat-<nick>"가 되어 31B 초과 → 광고 실패
+    //   - 닉네임은 SPIFFS(/node.conf)에 저장, Serial(node)에서만 표시
+    NimBLEDevice::init("bitchat");
     NimBLEDevice::setMTU(247);  // NimBLE 기본 MTU 247 (Bluedroid 517과 다름)
     // NimBLE는 setMTU만으로 client와 server 모두에 적용됨
 
@@ -207,6 +203,8 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     _service->start();
 
     // 2) Advertising - 배터리 모드에서는 저듀티 (1.28s 간격)
+    //    Service UUID를 광고에 포함 (bitchat 폰앱이 UUID로 릴레이 노드 발견)
+    //    광고 패킷: flags(3) + UUID(18) + "bitchat"(9) = 30 ≤ 31 ✓
     _advertising = NimBLEDevice::getAdvertising();
     _advertising->addServiceUUID(BC_BLE_SERVICE_UUID);
     _advertising->setScanResponse(true);
@@ -221,7 +219,7 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     _advertising->setMaxPreferred(0x12);
 #endif
     _advertising->start();
-    LOGI("BLE advertising started as %s (NimBLE)", BC_BLE_ADV_NAME);
+    LOGI("BLE advertising started as bitchat (NimBLE, UUID=%s)", BC_BLE_SERVICE_UUID);
 
     // 3) Scanner - NimBLE는 ms 단위
     _scan = NimBLEDevice::getScan();
