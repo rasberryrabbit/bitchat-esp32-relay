@@ -85,10 +85,21 @@ bool wifi_bridge_set_broker(const char* broker, uint16_t port);
 // 'wifi prefix <prefix>' 명령 - MQTT topic prefix 변경 (영속화)
 bool wifi_bridge_set_topic_prefix(const char* prefix);
 
+// 'wifi tls on/off' 명령 - mTLS 활성화 토글
+// on=true: WiFiClientSecure + 인증서 로드 (port 8883)
+// on=false: WiFiClient plain (port 1883, 기본값)
+// 인증서 파일 필요: /broker_ca.pem (필수), /client_cert.pem + /client_key.pem (mTLS 시)
+bool wifi_bridge_set_tls_enabled(bool on);
+bool wifi_bridge_get_tls_enabled(void);
+
 // 현재 MQTT broker 설정 반환 (캐시)
 const char* wifi_bridge_get_broker(void);
 uint16_t    wifi_bridge_get_port(void);
 const char* wifi_bridge_get_topic_prefix(void);
+
+// 인증서 파일 존재 여부 확인 (node_config_check_certs 위임)
+// 반환: bitmask (1=CA, 2=client_cert, 4=client_key)
+int wifi_bridge_check_certs(void);
 
 #ifdef __cplusplus
 }

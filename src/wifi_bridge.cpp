@@ -24,23 +24,33 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <base64.h>
 #include <string.h>
+
+// mTLS 인증서 파일 경로 (PEM 형식)
+#define BROKER_CA_FILE    "/broker_ca.pem"
+#define CLIENT_CERT_FILE  "/client_cert.pem"
+#define CLIENT_KEY_FILE   "/client_key.pem"
 
 // 상태
 static bool g_init_done = false;
 static bool g_enabled = false;          // 사용자가 wifi on 했는지
 static bool g_wifi_connected = false;
 static bool g_mqtt_connected = false;
-static WiFiClient g_wifi_client;
-static PubSubClient g_mqtt_client(g_wifi_client);
+static WiFiClient g_wifi_client;             // plain MQTT (1883)
+static WiFiClientSecure g_wifi_secure;       // mTLS MQTT (8883)
+static PubSubClient g_mqtt_client(g_wifi_client);  // 초기엔 plain, init에서 secure로 교체
 static char g_mqtt_broker[64] = BC_MQTT_BROKER;
 static uint16_t g_mqtt_port = BC_MQTT_PORT;
 static char g_topic_subscribe[40];      // bchat/rx/{node_id}
 static char g_topic_publish[20];        // bchat/tx
+static bool g_use_tls = false;          // mTLS 활성화 여부 (boot 시 /wifi.conf에서 로드)
 
 // 통계
 static uint32_t g_packets_tx = 0;       // MQTT로 publish한 패킷 수
@@ -135,9 +145,9 @@ bool wifi_bridge_init(void) {
     strncpy(g_mqtt_broker, cfg->mqtt_broker, sizeof(g_mqtt_broker) - 1);
     g_mqtt_broker[sizeof(g_mqtt_broker) - 1] = 0;
     g_mqtt_port = cfg->mqtt_port;
+    g_use_tls = cfg->use_tls;
 
     // 자체 node_id로 subscribe topic 설정
-    // g_storage는 main.cpp에 정의된 bitchat_storage_t 인스턴스
     extern bitchat_storage_t g_storage;
     char node_id[BITCHAT_ID_STR_LEN];
     bitchat_id_from_pk(g_storage.self_kp.public_key, node_id);
@@ -146,15 +156,68 @@ bool wifi_bridge_init(void) {
     snprintf(g_topic_publish, sizeof(g_topic_publish),
              "%s/tx", cfg->mqtt_topic_prefix);
 
+    // TLS 모드면 인증서 로드
+    if (g_use_tls) {
+        // SPIFFS에서 PEM 파일 로드 (CA 필수, client cert/key는 mTLS 시)
+        int cert_mask = node_config_check_certs();
+        if ((cert_mask & 1) == 0) {
+            LOGE("wifi_bridge: use_tls=ON but /broker_ca.pem missing");
+            LOGE("  → use 'cert upload ca' to provide CA cert (PEM format)");
+            LOGW("  → falling back to plain MQTT (port 1883)");
+            g_use_tls = false;
+            g_mqtt_port = 1883;
+        } else {
+            // CA 로드 (필수)
+            File ca_file = SPIFFS.open(BROKER_CA_FILE, "r");
+            if (ca_file) {
+                size_t ca_size = ca_file.size();
+                g_wifi_secure.loadCACert(ca_file, ca_size);
+                ca_file.close();
+                LOGI("wifi_bridge: loaded broker CA from %s (%u bytes)",
+                     BROKER_CA_FILE, (unsigned)ca_size);
+            }
+            // client cert + key 로드 (mTLS 시)
+            if (cert_mask & 2) {
+                File cert_file = SPIFFS.open(CLIENT_CERT_FILE, "r");
+                if (cert_file) {
+                    size_t cert_size = cert_file.size();
+                    g_wifi_secure.loadCertificate(cert_file, cert_size);
+                    cert_file.close();
+                    LOGI("wifi_bridge: loaded client cert from %s (%u bytes)",
+                         CLIENT_CERT_FILE, (unsigned)cert_size);
+                }
+            }
+            if (cert_mask & 4) {
+                File key_file = SPIFFS.open(CLIENT_KEY_FILE, "r");
+                if (key_file) {
+                    size_t key_size = key_file.size();
+                    g_wifi_secure.loadPrivateKey(key_file, key_size);
+                    key_file.close();
+                    LOGI("wifi_bridge: loaded client key from %s (%u bytes)",
+                         CLIENT_KEY_FILE, (unsigned)key_size);
+                }
+            }
+            // PubSubClient에 secure client 주입
+            g_mqtt_client.setClient(g_wifi_secure);
+            LOGI("wifi_bridge: mTLS enabled (CA + cert=%s + key=%s)",
+                 (cert_mask & 2) ? "loaded" : "missing",
+                 (cert_mask & 4) ? "loaded" : "missing");
+        }
+    } else {
+        // plain MQTT - WiFiClient 사용
+        g_mqtt_client.setClient(g_wifi_client);
+    }
+
     // MQTT 콜백 설정
     g_mqtt_client.setServer(g_mqtt_broker, g_mqtt_port);
-    g_mqtt_client.setBufferSize(BITCHAT_MAX_PKT_LEN * 2);   // base64는 4/3 확장
+    g_mqtt_client.setBufferSize(BITCHAT_MAX_PKT_LEN * 2);
     g_mqtt_client.setCallback(mqtt_callback);
-    g_mqtt_client.setKeepAlive(30);   // 30초 keep-alive
+    g_mqtt_client.setKeepAlive(30);
 
     g_init_done = true;
-    LOGI("wifi_bridge: ready (broker=%s:%u, topic_prefix=%s, ssid=%s)",
-         g_mqtt_broker, g_mqtt_port, cfg->mqtt_topic_prefix,
+    LOGI("wifi_bridge: ready (broker=%s:%u, tls=%s, topic_prefix=%s, ssid=%s)",
+         g_mqtt_broker, g_mqtt_port, g_use_tls ? "ON" : "OFF",
+         cfg->mqtt_topic_prefix,
          cfg->ssid[0] ? cfg->ssid : "(not set)");
     LOGI("wifi_bridge: subscribe=%s publish=%s",
          g_topic_subscribe, g_topic_publish);
@@ -368,6 +431,40 @@ bool wifi_bridge_set_topic_prefix(const char* prefix) {
     LOGI("wifi: mqtt topic prefix → %s (SPIFFS, ok=%d)", prefix, ok);
     LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
     return ok;
+}
+
+// ----- mTLS 설정 -----
+
+bool wifi_bridge_set_tls_enabled(bool on) {
+    if (on) {
+        // 인증서 존재 확인 (CA는 필수)
+        int mask = node_config_check_certs();
+        if ((mask & 1) == 0) {
+            LOGE("wifi: cannot enable TLS - /broker_ca.pem missing");
+            LOGE("  → use 'cert upload ca' to provide CA cert (PEM format)");
+            return false;
+        }
+        if (mask != 7) {
+            LOGW("wifi: TLS enabled but some certs missing (mask=0x%x)", mask);
+            if ((mask & 2) == 0) LOGW("  → /client_cert.pem missing (mTLS requires)");
+            if ((mask & 4) == 0) LOGW("  → /client_key.pem missing (mTLS requires)");
+            LOGW("  → TLS will work as CA-only mode (server verified, client not)");
+        }
+    }
+    bool ok = node_config_set_tls_enabled(on);
+    LOGI("wifi: tls → %s (SPIFFS, ok=%d, port=%u)",
+         on ? "ON" : "OFF", ok, on ? 8883 : 1883);
+    LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
+    return ok;
+}
+
+bool wifi_bridge_get_tls_enabled(void) {
+    if (!g_init_done) wifi_bridge_init();
+    return g_use_tls;
+}
+
+int wifi_bridge_check_certs(void) {
+    return node_config_check_certs();
 }
 
 const char* wifi_bridge_get_broker(void) {

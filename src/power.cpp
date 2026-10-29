@@ -43,6 +43,8 @@ static bool g_battery_ignore_cache = false;
 static bool g_battery_ignore_loaded = false;
 // 배터리 CRIT 시 spiffs_cache 자동 비활성화 추적 (1회만 수행, 회복 시 리셋)
 static bool g_auto_disabled_spiffs_at_crit = false;
+// 딥슬립 스킵 안내 로그 출력 여부 (첫 임계치 도달 시 1회만)
+static bool g_logged_deep_sleep_skipped = false;
 
 void power_get_default_config(power_config_t* cfg) {
     if (!cfg) return;
@@ -152,13 +154,28 @@ void power_handle_idle(void) {
     uint32_t now = millis();
     uint32_t idle_ms = now - g_last_active_ms;
 
-    // 5분 이상 무활동 시 딥슬립 진입
+    // 5분 이상 무활동 시 딥슬립 진입 (deep_sleep_enabled 플래그가 ON일 때만)
+    // 기본 OFF: BLE 메시 릴레이 노드는 RAM/BLE 연결을 잃지 않기 위해
+    // esp_pm의 auto light sleep만 사용 (CPU만 절전, BLE 컨트롤러는 동작 유지)
     if (g_cfg.deep_sleep_idle_ms > 0 &&
-        idle_ms > g_cfg.deep_sleep_idle_ms) {
-        LOGW("idle %u ms > threshold %u, entering deep sleep",
+        idle_ms > g_cfg.deep_sleep_idle_ms &&
+        storage_get_deep_sleep_enabled()) {
+        LOGW("idle %u ms > threshold %u, deep_sleep=ON → entering deep sleep",
              idle_ms, g_cfg.deep_sleep_idle_ms);
         power_enter_deep_sleep(60ULL * 1000000ULL);   // 60초 후 자동 wake
         // power_enter_deep_sleep이 리턴하지 않음 - 시스템 재부팅
+    } else if (g_cfg.deep_sleep_idle_ms > 0 &&
+               idle_ms > g_cfg.deep_sleep_idle_ms &&
+               !storage_get_deep_sleep_enabled()) {
+        // deep_sleep 플래그 OFF - 딥슬립 진입 안 함
+        // auto light sleep (esp_pm)이 CPU만 절전, BLE는 계속 동작
+        // 첫 임계치 도달 시 한 번만 로그 출력
+        if (!g_logged_deep_sleep_skipped) {
+            LOGI("idle %u ms > threshold %u but deep_sleep=OFF, staying in light sleep",
+                 idle_ms, g_cfg.deep_sleep_idle_ms);
+            LOGI("(enable via 'sleep deep on' if extreme battery saving needed)");
+            g_logged_deep_sleep_skipped = true;
+        }
     }
 
     // 상태 LED: alive 펄스 (1초당 50ms on)

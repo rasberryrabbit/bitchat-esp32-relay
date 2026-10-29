@@ -181,6 +181,7 @@ void storage_debug_dump(const bitchat_storage_t* st) {
     // 배터리 무시 플래그 상태 표시
     LOGI("battery_ignore=%s", storage_get_battery_ignore() ? "ON" : "OFF");
     LOGI("spiffs_cache_enabled=%s", storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+    LOGI("deep_sleep_enabled=%s", storage_get_deep_sleep_enabled() ? "ON" : "OFF");
 }
 
 // ----- 배터리 무시 플래그 (NVS 영속화) -----
@@ -255,6 +256,44 @@ bool storage_set_spiffs_cache_enabled(bool enabled) {
         return false;
     }
     LOGI("storage: spiffs_cache_enabled=%s (persisted to NVS)",
+         enabled ? "ON" : "OFF");
+    return true;
+}
+
+// ----- 딥슬립 허용 플래그 -----
+
+bool storage_get_deep_sleep_enabled(void) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;  // NVS 열기 실패 시 기본값 OFF
+    }
+    uint8_t val = 0;  // 기본값 OFF
+    esp_err_t err = nvs_get_u8(h, BC_NVS_KEY_DS_EN, &val);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        // 키가 없으면 첫 부팅 → 기본값 OFF
+        return false;
+    }
+    return val != 0;
+}
+
+bool storage_set_deep_sleep_enabled(bool enabled) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        LOGE("storage: NVS open failed for deep_sleep_enabled");
+        return false;
+    }
+    uint8_t val = enabled ? 1 : 0;
+    esp_err_t err = nvs_set_u8(h, BC_NVS_KEY_DS_EN, val);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        LOGE("storage: NVS set deep_sleep_enabled failed: 0x%04x", err);
+        return false;
+    }
+    LOGI("storage: deep_sleep_enabled=%s (persisted to NVS)",
          enabled ? "ON" : "OFF");
     return true;
 }

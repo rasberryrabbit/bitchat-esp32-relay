@@ -645,6 +645,299 @@ bat read              # ADC에서 전압 1회 즉시 읽기
 
 ---
 
+## 딥슬립 제어 (sleep deep)
+
+ESP32 딥슬립은 wake 시 무조건 reset이 발생합니다 (RAM 초기화, setup()부터 재실행). BLE 메시 릴레이 노드에서는 이 동작이 문제가 될 수 있습니다:
+
+- **BLE 연결 끊김**: 모든 peer 연결 해제, 재연결 필요
+- **RAM 상태 손실**: peer_keys, msg_cache, retry_queue 등 휘발성 데이터 손실
+- **~1초 재부팅**: 그 동안 들어오는 메시지 유실 가능
+
+### 기본값: OFF (light sleep만 사용)
+
+`esp_pm_configure(light_sleep_enable=true)`가 이미 활성화되어 있어, **CPU idle 시 자동으로 light sleep**에 진입합니다:
+- CPU 클럭 다운, RAM 상태 보존, BLE 컨트롤러 계속 동작
+- 패킷 수신 시 즉시 wake (지연 없음)
+- 배터리 소모: ~5-10mA (BLE advertising 1.28s 간격)
+
+### Serial 명령
+
+```text
+sleep             # 절전 모드 상태 출력 (battery_ignore, spiffs_cache, deep_sleep)
+sleep deep on     # 5분 idle 시 딥슬립 허용 (NVS 영속화, 극단 배터리 절약)
+sleep deep off    # 딥슬립 비활성화 (기본값, NVS 영속화)
+```
+
+### 동작 비교
+
+| 항목 | deep sleep OFF (기본) | deep sleep ON |
+|------|----------------------|---------------|
+| 5분 idle 시 동작 | auto light sleep 유지 | 60초 딥슬립 → wake reset |
+| BLE 연결 | 유지 (peer 재연결 불필요) | 끊김 (peer 재연결 필요) |
+| RAM 상태 | 보존 | 손실 (peer_keys, msg_cache, retry_queue) |
+| 전력 소모 (idle) | ~5-10mA | ~0.5mA (거의 0) |
+| Wake 지연 | 0ms (즉시) | ~1000ms (재부팅) |
+| 추천 용도 | BLE 메시 릴레이 노드 | 가끔 깨어나는 센서 노드 |
+
+### 사용 사례
+
+- **BLE 메시 릴레이 노드**: 기본 OFF 유지 → BLE continuity + RAM 보존 우선
+- **장기 미사용 / 배터리 극단 절약 필요**: `sleep deep on` → 5분 idle 시 60초 딥슬립
+- **배터리 부족 시 긴급 절전**: ON 후 재부팅 시 USB 충전 권장
+
+### ESP32 딥슬립의 정상 동작 (주의)
+
+로그에 아래와 같이 나타나면 정상입니다:
+```
+[W] idle 300001 ms > threshold 300000, deep_sleep=ON → entering deep sleep
+[I] entering deep sleep for 60000000 us...
+ets Jun  8 2016 00:22:57   ← 60초 후 자동 wake → reset 발생
+rst:0x5 (DEEPSLEEP_RESET), boot:0x13 (SPI_FAST_FLASH_BOOT)
+...
+=============================
+ bitchat ESP32 relay firmware
+ build: ...
+=============================      ← setup()부터 재실행
+```
+
+이 동작을 원치 않으면 `sleep deep off` (기본값)로 두면 됩니다.
+
+---
+
+## peer_keys 매핑 (SPIFFS 영속화)
+
+`src/peer_keys.h/.cpp` - senderID (8B) → Ed25519 공개키 (32B) 매핑:
+
+- bitchat 패킷의 senderID는 8B지만 서명 검증에는 32B pk 필요
+- ANNOUNCE 메시지 수신 시 자동으로 매핑 추가 (ble_relay.cpp)
+- MESSAGE 수신 시 매핑 조회하여 서명 검증
+
+### 백엔드: NVS → SPIFFS 이관
+
+이전에는 NVS blob (`bpkey` namespace)에 저장했으나, SPIFFS로 이관:
+
+| 항목 | 이전 (NVS) | 현재 (SPIFFS) |
+|------|-----------|----------------|
+| 파일/namespace | `bpkey/keys` blob | `/peer_keys.bin` 파일 |
+| 용량 | ~2.4KB blob | 2,368B (32개 × 74B) |
+| 부팅 시 동작 | NVS blob 로드 | SPIFFS 로드, NVS 마이그레이션(1회) |
+| 장점 | (이전) | 다른 설정(node.conf, wifi.conf)과 일관된 관리 |
+
+**자동 마이그레이션** (1회):
+- 부팅 시 `/peer_keys.bin`이 없고 NVS에 `bpkey` blob이 있으면 → SPIFFS로 이관 → NVS에서 삭제
+- 이후 모든 동작은 SPIFFS-only
+
+### Serial 명령
+
+```text
+peer              # 현재 매핑 dump (alias of list)
+peer list         - 모든 매핑 출력 (senderID + pk + key_mask)
+peer count        - 매핑 개수만 출력
+peer clear        - 전체 삭제 (SPIFFS /peer_keys.bin 제거)
+```
+
+매핑 추가는 자동: BLE ANNOUNCE 메시지 수신 시 자동 추가됩니다. 수동 add는 Serial로 제공하지 않습니다.
+
+---
+
+## mTLS 인증서 기반 보안 MQTT (port 8883)
+
+기존 평문 MQTT (port 1883) 대신 mTLS로 브로커와 상호 인증하는 보안 연결을 지원합니다.
+
+> **자체 CA 구축 가이드**: `tools/README.md` 참조 (CA 생성, 클라이언트 인증서 발급, 만료 관리, 회전 절차)
+>
+> **빠른 시작**:
+> ```bash
+> cd tools/
+> ./gen_ca.sh                              # 자체 CA 생성 (1회)
+> ./gen_client_cert.sh esp32-relay-1 365   # 클라이언트 인증서 발급 (1년)
+> # broker_ca.pem, client_cert.pem, client_key.pem → ESP32에 업로드
+> # Serial: cert upload ca/client/key, wifi tls on, wifi on
+> ```
+
+### 인증서 파일 (SPIFFS)
+
+| 파일 | 용도 | 필요 여부 |
+|------|------|-----------|
+| `/broker_ca.pem` | 브로커 CA 인증서 (브로커 검증) | **TLS 시 필수** |
+| `/client_cert.pem` | 클라이언트 인증서 (브로커가 클라이언트 검증) | mTLS 시 필수 |
+| `/client_key.pem` | 클라이언트 개인키 | mTLS 시 필수 |
+
+### Serial 명령
+
+```text
+# 인증서 관리
+cert                       # cert 파일 상태 출력
+cert status                - 위와 동일
+cert upload <ca|client|key> - PEM 내용 붙여넣기 (EOF 라인으로 종료)
+cert clear                 - 모든 PEM 파일 삭제
+cert show <ca|client|key>  - PEM 파일 내용 출력 (디버깅)
+
+# TLS 활성화
+wifi tls                   - 현재 TLS 상태 + 인증서 존재 여부
+wifi tls on                - mTLS 활성화 (port 자동 8883)
+wifi tls off               - 비활성화 (기본값, port 1883 평문)
+```
+
+### PEM 업로드 절차 (예시)
+
+```
+> cert upload ca
+cert: paste PEM content for /broker_ca.pem
+cert: end with a single line containing only 'EOF' (or send empty line)
+-----BEGIN CERTIFICATE-----
+MIIDxTCCAq2gAwIBAgIUTLrM...
+(PEM 내용 붙여넣기)
+-----END CERTIFICATE-----
+EOF
+cert: upload done (1234 bytes, 22 lines) → /broker_ca.pem
+
+> cert upload client
+... 동일하게 client cert PEM 붙여넣기, EOF로 종료 ...
+
+> cert upload key
+... 동일하게 client private key PEM 붙여넣기, EOF로 종료 ...
+
+> cert status
+=== cert status ===
+  /broker_ca.pem   : OK
+  /client_cert.pem : OK
+  /client_key.pem  : OK
+  mask=0x7 (mTLS ready mode)
+  use_tls=OFF (current wifi.conf)
+
+> wifi tls on
+wifi: tls → ON (SPIFFS, ok=1, port=8883)
+wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행
+
+> wifi on
+wifi_bridge: ready (broker=broker.example.com:8883, tls=ON, ...)
+wifi_bridge: loaded broker CA from /broker_ca.pem (1234 bytes)
+wifi_bridge: loaded client cert from /client_cert.pem (1456 bytes)
+wifi_bridge: loaded client key from /client_key.pem (1704 bytes)
+wifi_bridge: mTLS enabled (CA + cert=loaded + key=loaded)
+mqtt: connecting to broker broker.example.com:8883 ...
+mqtt: connected as bchat-xxxx
+```
+
+### 동작 모드
+
+| mask | 인증서 상태 | TLS 동작 |
+|------|-------------|----------|
+| 0 (none) | 파일 없음 | TLS 활성화 시도 → 자동 fallback 평문 |
+| 1 (CA only) | CA만 | CA-only TLS (서버만 검증, 클라이언트 인증 생략) |
+| 3 (CA+cert) | CA + client cert | 클라이언트 인증 불완전 → mTLS 연결 실패 가능 |
+| 7 (CA+cert+key) | 전부 있음 | **mTLS 정상 동작** (권장) |
+
+### 구현 상세
+
+- `WiFiClientSecure` + `loadCACert()` + `loadCertificate()` + `loadPrivateKey()`
+- PubSubClient에 secure client 주입: `g_mqtt_client.setClient(g_wifi_secure)`
+- 부팅 시 `/wifi.conf`의 `use_tls=1`이면 자동으로 인증서 로드 + port 8883
+- 인증서 없으면 자동으로 평문 MQTT (port 1883)로 fallback + 경고 로그
+
+### 보안 고려사항
+
+- **CA 인증서**: 공개되어도 무방 (브로커 검증용)
+- **client cert**: 공개되어도 무방 (브로커가 검증하는 공개 정보)
+- **client private key**: 절대 비공개 → SPIFFS에만 저장, Serial로 dump 안 함
+  - 단, `cert show key` 명령은 디버깅용으로 출력 (운영 환경에서는 비활성화 권장)
+- TLS handshake 시 메모리: ~40KB 추가 사용 (mbedTLS handshake buffer)
+- 암호화된 통신: TLS 1.2 (arduino-esp32 v2.0.17 기본), AES-128-GCM 또는 AES-256-GCM
+
+### 인증서 회전 (rotation)
+
+클라이언트 인증서는 유효기간(기본 1년)이 있어 만료 전에 갱신해야 합니다.
+
+**만료 모니터링** (cron 추천):
+```bash
+# 매일 09:00 검사, 30일 이내 만료 시 알림
+0 9 * * * /path/to/tools/check_cert_expiry.sh /path/to/esp32-relay.crt 30 \
+    || mail -s "ESP32 cert expiring soon" admin@example.com < /dev/null
+```
+
+**회전 절차**:
+```bash
+cd tools/
+./rotate_certs.sh esp32-relay-livingroom 365
+#   - 기존 인증서 .bak.YYYYMMDD-HHMMSS 확장자로 자동 백업
+#   - 새 인증서 발급 (CA 서명)
+#   - broker_ca.pem, client_cert.pem, client_key.pem 갱신
+#   - ESP32 업로드 절차 안내 + 롤백 지시 출력
+```
+
+상세 절차는 `tools/README.md`의 "인증서 만료 관리" 섹션 참조.
+
+---
+
+## ECDH 키 교환 + AES-GCM payload 암호화 (가능성 분석)
+
+mTLS로 MQTT 브로커 연결 보안은 확보했지만, BLE 메시 네트워크 내에서는 패킷이 평문으로 전송됩니다 (BLE 자체 암호화는 페어링 시에만). 릴레이 노드 간 end-to-end 암호화를 위한 ECDH + AES-GCM 도입 가능성을 분석합니다.
+
+### 기술적 가용성: ✅ 가능
+
+| 항목 | 라이브러리 | 상태 |
+|------|-----------|------|
+| ECDH (X25519) | libsodium `crypto_scalarmult_curve25519` | 이미 libsodium 사용 중 (crypto.cpp) |
+| ECDH (mbedTLS) | `mbedtls_ecdh_*`, Curve25519 지원 | arduino-esp32 v2.0.17에 포함 |
+| AES-GCM | mbedTLS `mbedtls_gcm_*` | arduino-esp32 v2.0.17에 포함 |
+| AEAD 대안 | libsodium `crypto_aead_xchacha20poly1305` | libsodium 자체 지원 |
+
+### 메모리/플래시 영향 추정
+
+| 항목 | 추가 크기 | 현재 상태 |
+|------|----------|-----------|
+| mbedTLS ECDH 코드 | ~10KB | app0 49.3% → ~51% (여전히 여유) |
+| mbedTLS AES-GCM 코드 | ~5KB | |
+| ECDH 세션당 RAM | ~200B (privkey + pubkey + shared secret) | 32개 peer × 200B = 6.4KB RAM |
+| AES-GCM nonce | 12B per packet | 기존 패킷당 12B 오버헤드 |
+
+### 구현 복잡도 (높음)
+
+이 작업은 단순 API 추가가 아니라 패킷 포맷 + 프로토콜 변경을 수반:
+
+1. **키 교환 단계**:
+   - 패킷 헤더에 X25519 공개키 (32B) 포함하는 새 ANNOUNCE 확장
+   - 상대방의 X25519 공개키 수신 시 `crypto_scalarmult_curve25519`로 shared secret 도출
+   - peer_keys 모듈에 shared_secret 필드 추가 (32B × 32개 = 1KB)
+
+2. **세션 관리**:
+   - 각 peer마다 독립적인 shared secret + nonce counter
+   - peer_keys.cpp 확장: peer_keys_get_session() API 추가
+   - SPIFFS에 영속화 필요 (세션 키는 reboot 후 유지되어야 함)
+
+3. **패킷 암호화**:
+   - bitchat_protocol.cpp 확장: 패킷 헤더에 encrypted flag + nonce + tag 추가
+   - payload만 암호화 (헤더는 평문 - relay가 TTL 감소 등 처리 가능)
+   - AES-GCM: 96-bit nonce + 128-bit tag
+
+4. **하위 호환성**:
+   - 기존 평문 패킷과 새 암호화 패킷이 공존해야 함
+   - 패킷 헤더의 새로운 flag로 구분 (예: `flags & 0x80 = encrypted`)
+   - 릴레이는 암호화된 패킷을 그대로 forward (payload만 암호화되므로)
+
+5. **API 변경 영향**:
+   - ble_relay.cpp: 암호화된 패킷 수신 시 복호화 → 서명 검증 → 처리
+   - lora_relay.cpp: LoRa도 동일한 암호화 적용 (양쪽 모두 같은 shared secret)
+   - wifi_bridge.cpp: MQTT payload도 암호화 (이미 mTLS로 전송 보안은 확보되었으나 end-to-end는 추가)
+
+### 권장 접근법
+
+**1단계 (현재 완료)**: mTLS로 MQTT 브로커 연결 보안 확보 (전송 구간 암호화)
+**2단계 (향후 작업)**: BLE 메시 end-to-end 암호화 도입
+   - libsodium의 `crypto_aead_xchacha20poly1305` 우선 검토 (mbedTLS보다 단순 + libsodium 이미 사용 중)
+   - X25519 ECDH로 shared secret 도출 → HKDF로 키 파생 → AEAD 암호화
+   - 점진적 마이그레이션: 새로운 패킷 타입 추가 (기존 패킷과 공존)
+
+### 결론
+
+- **기술적 가능성**: 충분히 가능 (라이브러리, 메모리, CPU 모두 OK)
+- **구현 범위**: 큰 작업 (패킷 포맷 + 프로토콜 + 세션 관리 + 하위 호환성)
+- **권장 순서**: mTLS 먼저 적용 (완료) → BLE end-to-end 암호화는 별도 이터레이션으로 진행
+- **대안**: BLE pairing (LE Secure Connections)으로 링크 단위 암호화도 가능하지만, 모든 peer와 페어링해야 하는 제약
+
+---
+
 ## NimBLE BLE 스텍 (Bluedroid 대안)
 
 본 펌웨어는 **NimBLE-Arduino** (h2zero) 라이브러리를 사용하여 ESP-IDF의 기본 Bluedroid 대신 더 가벼운 NimBLE 스텍을 사용합니다.
@@ -952,14 +1245,22 @@ bitchat-esp32-relay/
 │   ├── lora_relay.h/.cpp          # LoRa 자동감지 + BLE↔LoRa 브릿지 (SX127x)
 │   ├── packet_splitter.h/.cpp     # 큰 패킷 분할/재조립 (LoRa 222B 한계 우회)
 │   ├── msg_cache.h/.cpp          # store-and-forward RAM 캐시 (32 entries, 12h TTL)
-│   ├── msg_store.h/.cpp          # SPIFFS overflow backend (64 entries, /msg_store.bin)
+│   ├── msg_store.h/.cpp          # SPIFFS overflow backend (3072 entries, /msg_store.bin)
 │   ├── node_config.h/.cpp        # SPIFFS config files (/node.conf, /wifi.conf)
+│   ├── peer_keys.h/.cpp          # senderID → Ed25519 pk 매핑 (SPIFFS /peer_keys.bin)
 │   ├── wifi_bridge.h/.cpp         # WiFi+MQTT 브릿지 (BLE↔인터넷, Serial on/off)
 │   └── ble_relay.h/.cpp           # BLE GATT + relay (NimBLE, 배터리 모드 시 저듀티)
 ├── lib/                           # 외부 라이브러리 (자체 포함)
 │   ├── NimBLE-Arduino/            # h2zero NimBLE-Arduino 1.4.2
 │   ├── LoRa/                      # Sandeep Mistry arduino-LoRa 0.8.0
 │   └── PubSubClient/              # knolleary PubSubClient 2.8 (MQTT)
+├── tools/                         # mTLS 인증서 관리 도구
+│   ├── README.md                  # CA 구축/발급/회전 가이드
+│   ├── openssl.cnf                # OpenSSL 설정 (CA/client/server 확장)
+│   ├── gen_ca.sh                  # 자체 CA 생성 (ca.key, ca.crt, ca.srl)
+│   ├── gen_client_cert.sh         # 클라이언트 인증서 발급 (CA 서명)
+│   ├── check_cert_expiry.sh       # 만료일 확인 (cron 자동화 가능)
+│   └── rotate_certs.sh            # 인증서 회전 (백업 + 새 발급)
 ├── main/
 │   └── CMakeLists.txt             # ESP-IDF main 컴포넌트 (../src/ 참조)
 ├── firmware/                      # 빌드된 바이너리 (3개 보드)

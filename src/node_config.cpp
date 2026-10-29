@@ -127,6 +127,10 @@ static void wifi_cb(const char* key, const char* value, void* ctx) {
                strcmp(key, "mqtt_topic_prefix") == 0) {
         strncpy(c->mqtt_topic_prefix, value, MAX_TOPIC_PREFIX_LEN);
         c->mqtt_topic_prefix[MAX_TOPIC_PREFIX_LEN] = 0;
+    } else if (strcmp(key, "use_tls") == 0 || strcmp(key, "tls") == 0) {
+        // "1", "true", "on", "yes" → true / 그 외 → false
+        c->use_tls = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+                      strcmp(value, "on") == 0 || strcmp(value, "yes") == 0);
     }
 }
 
@@ -269,8 +273,14 @@ bool node_config_load_wifi(bc_wifi_config_t* cfg) {
     strncpy(cfg->mqtt_broker, BC_MQTT_BROKER, MAX_MQTT_BROKER_LEN);
     cfg->mqtt_port = BC_MQTT_PORT;
     strncpy(cfg->mqtt_topic_prefix, BC_MQTT_TOPIC_PREFIX, MAX_TOPIC_PREFIX_LEN);
+    cfg->use_tls = false;  // 기본값: plain MQTT (port 1883)
 
     parse_config_file(WIFI_CONFIG_FILE, wifi_cb, cfg);
+
+    // use_tls=true인데 port가 1883(기본)이면 자동으로 8883으로 변경
+    if (cfg->use_tls && cfg->mqtt_port == 1883) {
+        cfg->mqtt_port = 8883;
+    }
 
     // 캐시 업데이트
     memcpy(&g_wifi_cache, cfg, sizeof(g_wifi_cache));
@@ -298,12 +308,15 @@ bool node_config_save_wifi(const bc_wifi_config_t* cfg) {
     f.println((unsigned)cfg->mqtt_port);
     f.print("topic_prefix=");
     f.println(cfg->mqtt_topic_prefix);
+    f.print("use_tls=");
+    f.println(cfg->use_tls ? "1" : "0");
     f.close();
 
     // 캐시 업데이트
     memcpy(&g_wifi_cache, cfg, sizeof(g_wifi_cache));
-    LOGI("node_config: saved /wifi.conf (ssid='%s', broker=%s:%u)",
-         cfg->ssid, cfg->mqtt_broker, cfg->mqtt_port);
+    LOGI("node_config: saved /wifi.conf (ssid='%s', broker=%s:%u, tls=%s)",
+         cfg->ssid, cfg->mqtt_broker, cfg->mqtt_port,
+         cfg->use_tls ? "ON" : "OFF");
     return true;
 }
 
@@ -348,4 +361,36 @@ bool node_config_set_mqtt_topic_prefix(const char* prefix) {
     strncpy(cfg.mqtt_topic_prefix, prefix, MAX_TOPIC_PREFIX_LEN);
     cfg.mqtt_topic_prefix[MAX_TOPIC_PREFIX_LEN] = 0;
     return node_config_save_wifi(&cfg);
+}
+
+// ----- TLS (mTLS MQTT) 설정 -----
+
+bool node_config_set_tls_enabled(bool on) {
+    bc_wifi_config_t cfg;
+    node_config_load_wifi(&cfg);
+    cfg.use_tls = on;
+    // port 자동 조정: 1883 ↔ 8883
+    if (on && cfg.mqtt_port == 1883) {
+        cfg.mqtt_port = 8883;
+    } else if (!on && cfg.mqtt_port == 8883) {
+        cfg.mqtt_port = 1883;
+    }
+    return node_config_save_wifi(&cfg);
+}
+
+bool node_config_get_tls_enabled(void) {
+    return node_config_get_wifi()->use_tls;
+}
+
+// 인증서 파일 경로 정의 (PEM 형식)
+#define BROKER_CA_FILE   "/broker_ca.pem"
+#define CLIENT_CERT_FILE "/client_cert.pem"
+#define CLIENT_KEY_FILE  "/client_key.pem"
+
+int node_config_check_certs(void) {
+    int mask = 0;
+    if (SPIFFS.exists(BROKER_CA_FILE))   mask |= 1;  // bit 0: CA
+    if (SPIFFS.exists(CLIENT_CERT_FILE)) mask |= 2;  // bit 1: client cert
+    if (SPIFFS.exists(CLIENT_KEY_FILE))  mask |= 4;  // bit 2: client key
+    return mask;
 }

@@ -74,11 +74,22 @@ static void print_help(void) {
     Serial.println(F("cache spiffs    - show SPIFFS cache enable flag"));
     Serial.println(F("cache spiffs on - enable SPIFFS overflow cache (default, NVS persisted)"));
     Serial.println(F("cache spiffs off- disable SPIFFS overflow (drop only, no flash writes)"));
+    Serial.println(F("sleep           - power management status"));
+    Serial.println(F("sleep deep on   - enable deep sleep after 5min idle (NVS persisted)"));
+    Serial.println(F("sleep deep off  - disable deep sleep (default, light sleep only)"));
+    Serial.println(F("peer            - peer_keys mappings (senderID → Ed25519 pk)"));
+    Serial.println(F("peer list       - list all peer keys"));
+    Serial.println(F("peer clear      - clear all peer keys"));
     Serial.println(F("node             - node profile (nickname)"));
     Serial.println(F("node nick <name>- set node nickname (SPIFFS persisted)"));
     Serial.println(F("node nick clear  - remove nickname"));
     Serial.println(F("wifi broker <h> [p] - MQTT broker + port (SPIFFS persisted)"));
     Serial.println(F("wifi prefix <p>      - MQTT topic prefix (SPIFFS persisted)"));
+    Serial.println(F("wifi tls on          - enable mTLS MQTT (port 8883, certs required)"));
+    Serial.println(F("wifi tls off         - disable TLS (plain MQTT port 1883, default)"));
+    Serial.println(F("cert status          - show cert files status (CA/client/key)"));
+    Serial.println(F("cert upload <ca|client|key> - paste PEM (end with 'EOF' on its own line)"));
+    Serial.println(F("cert clear           - delete all cert PEM files"));
     Serial.println(F("help            - this help"));
     Serial.println(F("=======================\r\n"));
 }
@@ -206,6 +217,24 @@ static void handle_wifi_command(char* args) {
         // wifi prefix <prefix> - MQTT topic prefix 변경 (SPIFFS 영속화)
         if (!wifi_bridge_set_topic_prefix(arg)) {
             LOGE("wifi: failed to set prefix (SPIFFS write error)");
+        }
+    } else if (strcmp(cmd, "tls") == 0) {
+        // wifi tls [on|off|status]
+        if (!arg || *arg == 0 || strcmp(arg, "status") == 0) {
+            int mask = wifi_bridge_check_certs();
+            LOGI("wifi: tls=%s (port=%u)",
+                 wifi_bridge_get_tls_enabled() ? "ON" : "OFF",
+                 wifi_bridge_get_port());
+            LOGI("  certs: CA=%s, client_cert=%s, client_key=%s (mask=0x%x)",
+                 (mask & 1) ? "OK" : "MISSING",
+                 (mask & 2) ? "OK" : "MISSING",
+                 (mask & 4) ? "OK" : "MISSING", mask);
+        } else if (strcmp(arg, "on") == 0 || strcmp(arg, "enable") == 0) {
+            wifi_bridge_set_tls_enabled(true);
+        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "disable") == 0) {
+            wifi_bridge_set_tls_enabled(false);
+        } else {
+            LOGE("usage: wifi tls [on|off|status]");
         }
     } else {
         LOGE("unknown wifi subcommand: %s", cmd);
@@ -341,6 +370,260 @@ static void handle_battery_command(char* args) {
     }
 }
 
+// ============================================================
+// 절전 모드 Serial 명령 처리
+//
+// 지원 명령:
+//   sleep             - 현재 절전 모드 상태 출력 (battery_ignore, spiffs_cache, deep_sleep)
+//   sleep deep on     - 5분 idle 시 딥슬립 허용 (NVS 영속화)
+//   sleep deep off    - 딥슬립 비활성화, light sleep만 사용 (기본값, NVS 영속화)
+//
+// ESP32 딥슬립 동작 (주의):
+//   - wake 시 무조건 reset (RAM 초기화, setup()부터 재실행)
+//   - BLE 컨트롤러 끊김 → 모든 peer 연결 해제
+//   - RAM 상태 (peer_keys, msg_cache, retry_queue) 손실
+//   - ~1초 재부팅 시간 동안 메시지 유실 가능
+//
+// 기본값 OFF인 이유:
+//   - BLE 메시 릴레이 노드는 RAM 상태 + BLE continuity가 절전보다 중요
+//   - auto light sleep (esp_pm)이 CPU만 절전하므로 충분한 효과
+//   - 딥슬립은 배터리 극단 부족 / 장기 미사용 시에만 ON
+// ============================================================
+static void handle_sleep_command(char* args) {
+    if (!args || *args == 0 || strcmp(args, "status") == 0) {
+        LOGI("=== power management ===");
+        LOGI("battery_ignore=%s (BLE keep-alive at V_CRIT)",
+             storage_get_battery_ignore() ? "ON" : "OFF");
+        LOGI("spiffs_cache_enabled=%s (store-and-forward overflow)",
+             storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+        LOGI("deep_sleep_enabled=%s (5min idle → deep sleep + 60s wake reset)",
+             storage_get_deep_sleep_enabled() ? "ON" : "OFF (default, light sleep only)");
+        return;
+    }
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "deep") == 0) {
+        if (!arg || *arg == 0) {
+            LOGI("deep_sleep: %s",
+                 storage_get_deep_sleep_enabled() ? "ON" : "OFF");
+            return;
+        }
+        if (strcmp(arg, "on") == 0 || strcmp(arg, "enable") == 0) {
+            if (storage_set_deep_sleep_enabled(true)) {
+                LOGI("deep_sleep=ON (persisted, 5min idle → reset + 60s sleep)");
+                LOGW("주의: 딥슬립 wake 시 BLE 연결 끊김 + RAM 상태 손실");
+            } else {
+                LOGE("failed to set deep_sleep=ON (NVS error)");
+            }
+        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "disable") == 0) {
+            if (storage_set_deep_sleep_enabled(false)) {
+                LOGI("deep_sleep=OFF (persisted, light sleep only - BLE continuity 유지)");
+            } else {
+                LOGE("failed to set deep_sleep=OFF (NVS error)");
+            }
+        } else {
+            LOGE("usage: sleep deep [on|off]");
+        }
+    } else {
+        LOGE("unknown sleep subcommand: %s (try: deep [on|off])", cmd);
+    }
+}
+
+// ============================================================
+// peer_keys Serial 명령 처리
+//
+// 지원 명령:
+//   peer              - 현재 peer_keys 매핑 상태 출력 (alias of list)
+//   peer list         - 모든 매핑 dump (senderID + pk)
+//   peer clear        - 전체 삭제 (SPIFFS /peer_keys.bin 제거)
+//   peer count        - 개수만 출력
+//
+// 매핑 추가는 자동: BLE ANNOUNCE 메시지 수신 시 ble_relay.cpp에서 peer_keys_add() 호출
+// ============================================================
+static void handle_peer_command(char* args) {
+    if (!args || *args == 0 || strcmp(args, "list") == 0 || strcmp(args, "status") == 0) {
+        peer_keys_debug_dump();
+        return;
+    }
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "clear") == 0) {
+        peer_keys_clear();
+        LOGI("peer_keys cleared (SPIFFS /peer_keys.bin removed)");
+    } else if (strcmp(cmd, "count") == 0) {
+        LOGI("peer_keys count: %u", (unsigned)peer_keys_count());
+    } else {
+        LOGE("unknown peer subcommand: %s (try: list, clear, count)", cmd);
+    }
+}
+
+// ============================================================
+// 인증서 PEM 파일 업로드 Serial 명령 처리
+//
+// 지원 명령:
+//   cert                  - cert 파일 상태 출력 (CA/client_cert/client_key)
+//   cert status           - 위와 동일
+//   cert upload <target>  - PEM 내용을 붙여넣기 모드로 업로드
+//                            target: ca | client | key
+//                            EOF 라인(또는 빈 라인)까지 읽어 SPIFFS에 저장
+//   cert clear            - 모든 PEM 파일 삭제 (/broker_ca.pem, /client_cert.pem, /client_key.pem)
+//   cert show <target>    - PEM 파일 내용 출력 (디버깅)
+//
+// PEM 파일 경로:
+//   /broker_ca.pem   - 브로커 CA 인증서 (TLS 시 필수)
+//   /client_cert.pem - 클라이언트 인증서 (mTLS 시 필수)
+//   /client_key.pem  - 클라이언트 개인키 (mTLS 시 필수)
+// ============================================================
+
+// 인증서 파일 경로 (wifi_bridge.cpp와 동일)
+#define BROKER_CA_FILE    "/broker_ca.pem"
+#define CLIENT_CERT_FILE  "/client_cert.pem"
+#define CLIENT_KEY_FILE   "/client_key.pem"
+
+// target 문자열 → 파일 경로 변환
+static const char* cert_target_to_path(const char* target) {
+    if (!target) return nullptr;
+    if (strcmp(target, "ca") == 0 || strcmp(target, "broker_ca") == 0) {
+        return BROKER_CA_FILE;
+    } else if (strcmp(target, "client") == 0 || strcmp(target, "client_cert") == 0 ||
+               strcmp(target, "cert") == 0) {
+        return CLIENT_CERT_FILE;
+    } else if (strcmp(target, "key") == 0 || strcmp(target, "client_key") == 0) {
+        return CLIENT_KEY_FILE;
+    }
+    return nullptr;
+}
+
+// PEM 업로드: 'EOF' 라인 또는 빈 라인까지 읽어 파일에 저장
+// Serial 입력 버퍼에서 한 번에 한 줄씩 읽음
+static bool upload_pem(const char* path) {
+    LOGI("cert: paste PEM content for %s", path);
+    LOGI("cert: end with a single line containing only 'EOF' (or send empty line)");
+
+    File f = SPIFFS.open(path, "w");
+    if (!f) {
+        LOGE("cert: open(%s, w) failed", path);
+        return false;
+    }
+
+    // 임시 버퍼: PEM은 한 줄이 최대 80자 (base64 64자 + header/footer)
+    char line[128];
+    int line_pos = 0;
+    uint32_t start = millis();
+    uint32_t timeout_ms = 60000;  // 60초 내에 EOF 안 오면 취소
+    size_t total_bytes = 0;
+    int total_lines = 0;
+
+    while (millis() - start < timeout_ms) {
+        while (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\r') continue;  // CR 무시
+            if (c == '\n') {
+                line[line_pos] = 0;
+                // EOF 체크
+                if (strcmp(line, "EOF") == 0 || (line_pos == 0)) {
+                    f.close();
+                    LOGI("cert: upload done (%u bytes, %d lines) → %s",
+                         (unsigned)total_bytes, total_lines, path);
+                    return true;
+                }
+                // 파일에 라인 저장
+                f.println(line);
+                total_bytes += line_pos + 2;  // \r\n 가정
+                total_lines++;
+                // 진행 표시
+                if (total_lines % 5 == 0) {
+                    Serial.print(".");
+                }
+                line_pos = 0;
+                start = millis();  // 타임아웃 리셋
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+            // 라인 길이 초과 시 무시 (PEM은 80자 이내)
+        }
+        // 잠시 대기 (CPU 양보)
+        delay(10);
+    }
+
+    f.close();
+    LOGE("cert: upload timeout (60s no EOF) - partial data discarded");
+    SPIFFS.remove(path);  // 부분 업로드된 파일 삭제
+    return false;
+}
+
+static void handle_cert_command(char* args) {
+    if (!args || *args == 0 || strcmp(args, "status") == 0) {
+        // 상태 출력
+        int mask = wifi_bridge_check_certs();
+        LOGI("=== cert status ===");
+        LOGI("  /broker_ca.pem   : %s", (mask & 1) ? "OK" : "MISSING");
+        LOGI("  /client_cert.pem : %s", (mask & 2) ? "OK" : "MISSING");
+        LOGI("  /client_key.pem  : %s", (mask & 4) ? "OK" : "MISSING");
+        LOGI("  mask=0x%x (%s mode)", mask,
+             mask == 7 ? "mTLS ready" : (mask & 1) ? "CA-only TLS" : "TLS unavailable");
+        LOGI("  use_tls=%s (current wifi.conf)", wifi_bridge_get_tls_enabled() ? "ON" : "OFF");
+        return;
+    }
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "upload") == 0) {
+        if (!arg || *arg == 0) {
+            LOGE("usage: cert upload <ca|client|key>");
+            return;
+        }
+        const char* path = cert_target_to_path(arg);
+        if (!path) {
+            LOGE("unknown cert target: %s (try: ca, client, key)", arg);
+            return;
+        }
+        if (!upload_pem(path)) {
+            LOGE("cert: upload failed for %s", path);
+        }
+    } else if (strcmp(cmd, "clear") == 0) {
+        bool removed_any = false;
+        if (SPIFFS.remove(BROKER_CA_FILE))   removed_any = true;
+        if (SPIFFS.remove(CLIENT_CERT_FILE)) removed_any = true;
+        if (SPIFFS.remove(CLIENT_KEY_FILE))  removed_any = true;
+        LOGI("cert: cleared all PEM files (%s)",
+             removed_any ? "some removed" : "none existed");
+    } else if (strcmp(cmd, "show") == 0) {
+        if (!arg || *arg == 0) {
+            LOGE("usage: cert show <ca|client|key>");
+            return;
+        }
+        const char* path = cert_target_to_path(arg);
+        if (!path) {
+            LOGE("unknown cert target: %s", arg);
+            return;
+        }
+        if (!SPIFFS.exists(path)) {
+            LOGE("cert: %s does not exist", path);
+            return;
+        }
+        File f = SPIFFS.open(path, "r");
+        if (!f) {
+            LOGE("cert: open(%s) failed", path);
+            return;
+        }
+        LOGI("=== %s (%u bytes) ===", path, (unsigned)f.size());
+        while (f.available()) {
+            String line = f.readStringUntil('\n');
+            Serial.println(line);
+        }
+        f.close();
+        LOGI("=== end of %s ===", path);
+    } else {
+        LOGE("unknown cert subcommand: %s (try: status, upload, clear, show)", cmd);
+    }
+}
+
 static void process_serial_input(void) {
     while (Serial.available()) {
         char c = Serial.read();
@@ -363,6 +646,12 @@ static void process_serial_input(void) {
                     handle_battery_command(args);
                 } else if (strcmp(cmd, "node") == 0) {
                     handle_node_command(args);
+                } else if (strcmp(cmd, "sleep") == 0) {
+                    handle_sleep_command(args);
+                } else if (strcmp(cmd, "peer") == 0) {
+                    handle_peer_command(args);
+                } else if (strcmp(cmd, "cert") == 0) {
+                    handle_cert_command(args);
                 } else if (strcmp(cmd, "cache") == 0) {
                     if (!args || *args == 0 || strcmp(args, "status") == 0) {
                         msg_cache_debug_dump();

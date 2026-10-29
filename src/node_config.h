@@ -62,6 +62,7 @@ typedef struct {
     char     mqtt_broker[MAX_MQTT_BROKER_LEN + 1];
     uint16_t mqtt_port;
     char     mqtt_topic_prefix[MAX_TOPIC_PREFIX_LEN + 1];
+    bool     use_tls;              // true: mTLS (port 8883), false: plain (port 1883)
 } bc_wifi_config_t;
 
 // 초기화 - SPIFFS 마운트 + 파일 로드 + NVS 마이그레이션 (1회)
@@ -102,6 +103,35 @@ const bc_wifi_config_t* node_config_get_wifi(void);
 bool node_config_set_wifi_credentials(const char* ssid, const char* pass);
 bool node_config_set_mqtt_broker(const char* broker, uint16_t port);
 bool node_config_set_mqtt_topic_prefix(const char* prefix);
+
+// ----- TLS (mTLS MQTT) 설정 -----
+//
+//   use_tls=true 시 MQTT 연결에 mTLS 사용:
+//     - port: 자동으로 8883 (또는 사용자 지정)
+//     - 인증서: SPIFFS의 PEM 파일에서 로드
+//       /broker_ca.pem  - 브로커 CA 인증서 (브로커 검증)
+//       /client_cert.pem - 클라이언트 인증서 (브로커가 클라이언트 검증)
+//       /client_key.pem  - 클라이언트 개인키
+//     - WiFiClientSecure 사용, PubSubClient에 주입
+//
+//   use_tls=false (기본): plain MQTT, port 1883, WiFiClient 사용
+//
+//   인증서 업로드:
+//     Serial 명령 `cert upload <ca|client|key>` → PEM 내용 붙여넣기
+//     또는 SPIFFS 이미지 빌드 시 포함
+
+// TLS 활성화 토글 (wifi.conf의 use_tls 필드, NVS에 영속화)
+// on=true → use_tls=1, port=8883 (기본) / on=false → use_tls=0, port=1883
+bool node_config_set_tls_enabled(bool on);
+
+// 현재 TLS 설정 조회 (캐시)
+bool node_config_get_tls_enabled(void);
+
+// 인증서 파일 존재 여부 확인 (SPIFFS)
+// 반환: 0=none, 1=CA만, 3=CA+client_cert, 7=CA+cert+key (전체)
+// mTLS에 필요한 최소: 7 (CA + client cert + client key)
+// CA-only 모드도 가능 (서버만 검증, 클라이언트 인증 생략) - 1 이상이면 TLS 가능
+int node_config_check_certs(void);
 
 #ifdef __cplusplus
 }

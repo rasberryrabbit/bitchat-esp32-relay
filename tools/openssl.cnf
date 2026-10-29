@@ -1,0 +1,85 @@
+# bitchat ESP32 relay - OpenSSL CA configuration
+#
+# 이 파일은 자체 CA를 구축할 때 OpenSSL이 참조하는 설정.
+# CA 인증서와 클라이언트 인증서 발급 시 모두 사용.
+#
+# 사용:
+#   openssl req -new -x509 -key ca.key -out ca.crt -config openssl.cnf -extensions v3_ca
+#   openssl req -new -key client.key -out client.csr -config openssl.cnf
+#   openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+#     -out client.crt -days 365 -extfile openssl.cnf -extensions usr_cert
+
+[ca]
+default_ca = CA_default
+
+[CA_default]
+dir               = ./ca_db
+certs             = $dir/certs
+crl_dir           = $dir/crl
+new_certs_dir     = $dir/newcerts
+database          = $dir/index.txt
+serial            = $dir/serial
+RANDFILE          = $dir/.rand
+certificate       = ./ca.crt
+private_key       = ./ca.key
+default_days      = 365
+default_crl_days  = 30
+default_md        = sha256
+preserve          = no
+policy            = policy_loose
+x509_extensions   = usr_cert
+copy_extensions   = copy
+
+[policy_loose]
+countryName             = optional
+stateOrProvinceName     = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[req]
+default_bits        = 2048
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+x509_extensions     = v3_ca
+prompt              = no
+
+[req_distinguished_name]
+# CA 인증서의 subject 정보 (원하면 변경)
+C  = KR
+O  = bitchat-relay
+OU = self-signed CA
+CN = bitchat-relay CA
+
+[v3_ca]
+# CA 인증서용 확장 (CA:TRUE)
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, digitalSignature, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always, issuer
+
+[usr_cert]
+# 클라이언트 인증서용 확장 (mTLS 클라이언트 인증)
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid, issuer
+
+[server_cert]
+# MQTT 브로커 서버 인증서용 확장 (serverAuth)
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid, issuer
+subjectAltName = @alt_names
+
+[alt_names]
+# 브로커 인증서의 경우 DNS 또는 IP로 브로커 주소 지정 필요
+# 예: DNS.1 = broker.example.com
+#     IP.1 = 192.168.1.100
+DNS.1 = localhost
+IP.1 = 127.0.0.1

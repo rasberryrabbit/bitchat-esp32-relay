@@ -30,6 +30,7 @@ extern "C" {
 #define BC_NVS_KEY_CONFIG "cfg"
 #define BC_NVS_KEY_BAT_IGN "bat_ign"  // 배터리 상태 무시 플래그 (uint8_t, 0/1)
 #define BC_NVS_KEY_SFF_EN  "sff_en"   // store-and-forward SPIFFS 캐시 enable (uint8_t, 0/1, 기본 1=ON)
+#define BC_NVS_KEY_DS_EN   "dpslp"    // 딥슬립 허용 플래그 (uint8_t, 0/1, 기본 0=OFF)
 #define BC_MAX_PEERS       32  // 최대 캐시 피어 수
 
 typedef struct {
@@ -106,6 +107,35 @@ bool storage_set_battery_ignore(bool ignore);
 
 bool storage_get_spiffs_cache_enabled(void);  // 기본 true
 bool storage_set_spiffs_cache_enabled(bool enabled);
+
+// ----- 딥슬립 허용 플래그 (NVS 영속화) -----
+//
+//   5분간 무활동 시 자동 딥슬립 진입을 허용할지 말지를 제어.
+//   기본값: OFF (BLE 메시 릴레이 노드에 부적합 - 딥슬립 시 BLE 끊김, RAM 손실)
+//
+//   ESP32 딥슬립 특성 (주의):
+//     - wake 시 무조건 reset 발생 (RAM 초기화, setup()부터 재실행)
+//     - BLE 컨트롤러 끊김 → 모든 peer 연결 해제
+//     - RAM 상태 (peer_keys, msg_cache, retry_queue) 전부 손실
+//     - ~1초 재부팅 시간 동안 메시지 유실 가능
+//
+//   OFF일 때 동작 (기본):
+//     - 5분 idle 임계치 도달해도 딥슬립 진입 안 함
+//     - 대신 esp_pm의 auto light sleep이 유휴 시 CPU만 절전 (BLE 컨트롤러는 계속 동작)
+//     - RAM 상태 보존, BLE 연결 유지, 메시지 유실 없음
+//
+//   ON일 때 동작:
+//     - 5분 idle 시 60초 딥슬립 → wake 후 reset → setup()부터 재실행
+//     - 극단적 배터리 절약이 필요한 경우 (예: 장기 미사용 시)
+//     - 대신 모든 상태 손실 감수
+//
+//   사용 사례:
+//     - 릴레이 노드: OFF 유지 (기본값) - BLE continuity 우선
+//     - 가끔 깨어나는 센서 노드: ON - 배터리 우선
+//     - 배터리 부족 시 긴급 절전: ON 후 재부팅 시 USB 연결하여 충전
+
+bool storage_get_deep_sleep_enabled(void);  // 기본 false (OFF)
+bool storage_set_deep_sleep_enabled(bool enabled);
 
 #ifdef __cplusplus
 }

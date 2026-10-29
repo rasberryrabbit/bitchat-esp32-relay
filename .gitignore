@@ -1,0 +1,22 @@
+# bitchat ESP32 relay - sensitive files
+# 민감한 키 파일은 절대 커밋하지 않음
+
+# CA 개인키 (CRITICAL - 절대 커밋 금지)
+tools/ca.key
+tools/ca.srl
+
+# 클라이언트 개인키 (CRITICAL - 절대 커밋 금지)
+tools/*.key
+tools/*.pem
+
+# 백업 파일 (이전 키 포함)
+tools/*.bak.*
+
+# 빌드 산출물
+.pio/
+*.bak
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
