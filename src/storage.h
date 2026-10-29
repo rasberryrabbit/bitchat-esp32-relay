@@ -105,8 +105,31 @@ bool storage_set_battery_ignore(bool ignore);
 //     - 배터리 부족 + SPIFFS 마모 우려 시 일시적 비활성화
 //     - 디버깅: store-and-forward 기능 자체를 끄고 싶을 때
 
-bool storage_get_spiffs_cache_enabled(void);  // 기본 true
+bool storage_get_spiffs_cache_enabled(void);  // 사용자 설정 (NVS 영속, 기본 true)
 bool storage_set_spiffs_cache_enabled(bool enabled);
+
+// ----- SPIFFS 캐시 런타임 오버라이드 (RAM만, NVS에 저장 안 함) -----
+//
+//   배터리 CRIT 등 시스템 상황에 따라 임시로 SPIFFS 쓰기를 금지.
+//   사용자의 NVS 설정(user_setting)은 보존되고, 런타임 오버라이드만 적용/해제.
+//
+//   실제 동작(effective) = user_setting AND NOT runtime_disabled
+//     - user=ON, runtime=false → effective=ON (정상)
+//     - user=ON, runtime=true  → effective=OFF (배터리 CRIT로 임시 비활성)
+//     - user=OFF, runtime=any  → effective=OFF (사용자가 명시적으로 끔)
+//
+//   배터리 회복 시 runtime_disabled=false → 자동으로 user_setting 복귀
+//   (사용자가 수동으로 cache spiffs on 할 필요 없음)
+
+// 런타임 오버라이드 설정 (RAM만, 재부팅 시 false로 리셋)
+void storage_set_spiffs_runtime_disabled(bool disabled);
+
+// 런타임 오버라이드 상태 조회
+bool storage_get_spiffs_runtime_disabled(void);
+
+// 실제 동작 상태 = user_setting AND NOT runtime_disabled
+// msg_cache.cpp 등에서 SPIFFS 쓰기 여부 판단 시 이 함수 사용
+bool storage_get_spiffs_cache_effective(void);
 
 // ----- 딥슬립 허용 플래그 (NVS 영속화) -----
 //

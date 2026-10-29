@@ -180,7 +180,10 @@ void storage_debug_dump(const bitchat_storage_t* st) {
     }
     // 배터리 무시 플래그 상태 표시
     LOGI("battery_ignore=%s", storage_get_battery_ignore() ? "ON" : "OFF");
-    LOGI("spiffs_cache_enabled=%s", storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+    LOGI("spiffs_cache: user=%s, runtime=%s, effective=%s",
+         storage_get_spiffs_cache_enabled() ? "ON" : "OFF",
+         storage_get_spiffs_runtime_disabled() ? "DISABLED" : "OK",
+         storage_get_spiffs_cache_effective() ? "ON" : "OFF");
     LOGI("deep_sleep_enabled=%s", storage_get_deep_sleep_enabled() ? "ON" : "OFF");
 }
 
@@ -255,9 +258,32 @@ bool storage_set_spiffs_cache_enabled(bool enabled) {
         LOGE("storage: NVS set spiffs_cache_enabled failed: 0x%04x", err);
         return false;
     }
-    LOGI("storage: spiffs_cache_enabled=%s (persisted to NVS)",
+    LOGI("storage: spiffs_cache_enabled(user)=%s (persisted to NVS)",
          enabled ? "ON" : "OFF");
     return true;
+}
+
+// ----- SPIFFS 캐시 런타임 오버라이드 (RAM만) -----
+
+static bool g_spiffs_runtime_disabled = false;  // RAM만, 재부팅 시 false
+
+void storage_set_spiffs_runtime_disabled(bool disabled) {
+    if (g_spiffs_runtime_disabled != disabled) {
+        g_spiffs_runtime_disabled = disabled;
+        LOGI("storage: spiffs_runtime_disabled=%s (RAM only, NVS untouched)",
+             disabled ? "ON" : "OFF");
+    }
+}
+
+bool storage_get_spiffs_runtime_disabled(void) {
+    return g_spiffs_runtime_disabled;
+}
+
+bool storage_get_spiffs_cache_effective(void) {
+    // effective = user_setting AND NOT runtime_disabled
+    bool user = storage_get_spiffs_cache_enabled();
+    bool runtime = g_spiffs_runtime_disabled;
+    return user && !runtime;
 }
 
 // ----- 딥슬립 허용 플래그 -----

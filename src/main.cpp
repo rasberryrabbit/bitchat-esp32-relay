@@ -394,8 +394,10 @@ static void handle_sleep_command(char* args) {
         LOGI("=== power management ===");
         LOGI("battery_ignore=%s (BLE keep-alive at V_CRIT)",
              storage_get_battery_ignore() ? "ON" : "OFF");
-        LOGI("spiffs_cache_enabled=%s (store-and-forward overflow)",
-             storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+        LOGI("spiffs_cache: user=%s, runtime=%s, effective=%s (store-and-forward overflow)",
+             storage_get_spiffs_cache_enabled() ? "ON" : "OFF",
+             storage_get_spiffs_runtime_disabled() ? "DISABLED(battery)" : "OK",
+             storage_get_spiffs_cache_effective() ? "ON" : "OFF");
         LOGI("deep_sleep_enabled=%s (5min idle → deep sleep + 60s wake reset)",
              storage_get_deep_sleep_enabled() ? "ON" : "OFF (default, light sleep only)");
         return;
@@ -666,18 +668,22 @@ static void process_serial_input(void) {
                         char* sub = args + 6;
                         while (*sub == ' ') sub++;  // skip whitespace
                         if (*sub == 0) {
-                            // 상태만 출력
-                            LOGI("spiffs_cache: %s (NVS-persisted, default=ON)",
-                                 storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+                            // 상태만 출력: user / runtime / effective 3단계
+                            LOGI("spiffs_cache: user=%s, runtime=%s, effective=%s",
+                                 storage_get_spiffs_cache_enabled() ? "ON" : "OFF",
+                                 storage_get_spiffs_runtime_disabled() ? "DISABLED(battery CRIT)" : "OK",
+                                 storage_get_spiffs_cache_effective() ? "ON" : "OFF");
+                            LOGI("  (user: NVS-persisted, runtime: RAM-only auto by battery, effective=actual)");
                         } else if (strcmp(sub, "on") == 0 || strcmp(sub, "enable") == 0) {
                             if (storage_set_spiffs_cache_enabled(true)) {
-                                LOGI("spiffs_cache=ON (persisted, RAM overflow → SPIFFS)");
+                                LOGI("spiffs_cache user=ON (persisted, effective=%s)",
+                                     storage_get_spiffs_cache_effective() ? "ON" : "OFF (runtime disabled)");
                             } else {
                                 LOGE("failed to set spiffs_cache=ON (NVS error)");
                             }
                         } else if (strcmp(sub, "off") == 0 || strcmp(sub, "disable") == 0) {
                             if (storage_set_spiffs_cache_enabled(false)) {
-                                LOGI("spiffs_cache=OFF (persisted, RAM overflow → drop only)");
+                                LOGI("spiffs_cache user=OFF (persisted, effective=OFF)");
                                 LOGI("기존 SPIFFS 데이터는 유지되어 flush 시 전달됨");
                             } else {
                                 LOGE("failed to set spiffs_cache=OFF (NVS error)");

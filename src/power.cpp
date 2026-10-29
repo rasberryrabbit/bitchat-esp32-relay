@@ -41,8 +41,6 @@ static float g_last_battery_v = 0.0f;
 // 배터리 무시 플래그 캐시 (boot 시 NVS에서 1회 로드, 이후 RAM 조회)
 static bool g_battery_ignore_cache = false;
 static bool g_battery_ignore_loaded = false;
-// 배터리 CRIT 시 spiffs_cache 자동 비활성화 추적 (1회만 수행, 회복 시 리셋)
-static bool g_auto_disabled_spiffs_at_crit = false;
 // 딥슬립 스킵 안내 로그 출력 여부 (첫 임계치 도달 시 1회만)
 static bool g_logged_deep_sleep_skipped = false;
 
@@ -228,23 +226,21 @@ void power_handle_idle(void) {
             }
 
             // 배터리 CRIT 시 공통 액션 (battery_ignore 여부와 무관):
-            // SPIFFS 캐시 자동 비활성화 - 플래시 마모 보호
-            // 1회만 실행 (회복 시 g_auto_disabled_spiffs_at_crit 리셋)
-            if (!g_auto_disabled_spiffs_at_crit) {
-                if (storage_get_spiffs_cache_enabled()) {
-                    if (storage_set_spiffs_cache_enabled(false)) {
-                        LOGW("battery CRIT: cache spiffs OFF auto-set (flash wear protection)");
-                    }
-                }
-                g_auto_disabled_spiffs_at_crit = true;
+            // SPIFFS 캐시 런타임 비활성화 - 플래시 마모 보호
+            // NVS에 저장하지 않고 RAM에만 설정 → 회복 시 자동 복귀
+            // (사용자의 cache spiffs on/off 설정 보존)
+            if (!storage_get_spiffs_runtime_disabled()) {
+                storage_set_spiffs_runtime_disabled(true);
+                LOGW("battery CRIT: spiffs_cache runtime disabled (user setting preserved, auto-recover on battery restore)");
             }
         } else if (g_last_battery_v > 0 && g_last_battery_v >= BC_BATTERY_V_CRIT + 0.1f) {
-            // 전압이 CRIT 위로 회복 시 자동 disable 플래그 리셋
-            // (사용자가 다시 cache spiffs on 하면 정상 동작 복귀 가능)
-            if (g_auto_disabled_spiffs_at_crit) {
-                LOGI("battery recovered above CRIT (%.2fV) - auto-disable flag reset",
-                     g_last_battery_v);
-                g_auto_disabled_spiffs_at_crit = false;
+            // 전압이 CRIT 위로 회복 시 런타임 오버라이드 해제
+            // → effective = user_setting (사용자가 켜놨었으면 자동으로 다시 ON)
+            if (storage_get_spiffs_runtime_disabled()) {
+                storage_set_spiffs_runtime_disabled(false);
+                LOGI("battery recovered above CRIT (%.2fV) - spiffs_cache runtime override cleared, effective=%s",
+                     g_last_battery_v,
+                     storage_get_spiffs_cache_effective() ? "ON" : "OFF");
             }
         }
     }

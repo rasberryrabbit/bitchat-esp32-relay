@@ -2,7 +2,7 @@
 #include "msg_cache.h"
 #include "msg_store.h"   // SPIFFS overflow backend
 #include "bitchat_protocol.h"   // bitchat_parse로 recipient_id 추출 (broadcast 필터)
-#include "storage.h"   // storage_get_spiffs_cache_enabled() - SPIFFS write enable flag
+#include "storage.h"   // storage_get_spiffs_cache_effective() - SPIFFS write enable (user + runtime)
 #include "log.h"
 #include <string.h>
 #include <Arduino.h>
@@ -67,11 +67,12 @@ static bool overflow_oldest_to_store(void) {
 
     msg_cache_entry_t* old = &g_cache[oldest_idx];
 
-    // SPIFFS 캐시 enabled 확인 (NVS 플래그, 기본 ON)
+    // SPIFFS 캐시 effective 확인 (user_setting AND NOT runtime_disabled)
     // OFF이면 어떤 패킷이든 SPIFFS에 안 쓰고 drop만 (기존 데이터는 유지)
-    if (!storage_get_spiffs_cache_enabled()) {
+    // runtime_disabled는 배터리 CRIT 시 power.cpp에서 설정 (회복 시 자동 해제)
+    if (!storage_get_spiffs_cache_effective()) {
         g_overflow_disabled++;
-        LOGD("msg_cache: overflow drop (spiffs_cache disabled, slot=%u, len=%u)",
+        LOGD("msg_cache: overflow drop (spiffs_cache effective=OFF, slot=%u, len=%u)",
              oldest_idx, (unsigned)old->len);
         // RAM에서 제거만 (SPIFFS write 없음)
         old->active = false;
@@ -196,9 +197,11 @@ void msg_cache_cleanup(void) {
 void msg_cache_debug_dump(void) {
     LOGI("=== msg_cache: %u active, cached=%u flushed=%u ===",
          (unsigned)msg_cache_count(), g_total_cached, g_total_flushed);
-    LOGI("  overflow: to_store=%u dropped=%u disabled=%u (spiffs_cache=%s)",
+    LOGI("  overflow: to_store=%u dropped=%u disabled=%u (effective=%s, user=%s, runtime=%s)",
          g_overflow_to_store, g_overflow_dropped, g_overflow_disabled,
-         storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+         storage_get_spiffs_cache_effective() ? "ON" : "OFF",
+         storage_get_spiffs_cache_enabled() ? "ON" : "OFF",
+         storage_get_spiffs_runtime_disabled() ? "DISABLED" : "OK");
     for (uint32_t i = 0; i < MSG_CACHE_SIZE; ++i) {
         if (!g_cache[i].active) continue;
         uint32_t age = (millis() - g_cache[i].timestamp_ms) / 1000;
