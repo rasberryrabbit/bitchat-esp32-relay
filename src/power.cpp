@@ -12,6 +12,7 @@
 
 #include "power.h"
 #include "log.h"
+#include "storage.h"   // storage_get_battery_ignore() for battery-ignore flag
 
 #include <Arduino.h>
 #include <esp_pm.h>
@@ -37,6 +38,11 @@ static uint32_t g_last_led_pulse_ms = 0;
 static uint32_t g_last_alive_pulse_ms = 0;
 static bool g_led_state = false;
 static float g_last_battery_v = 0.0f;
+// 배터리 무시 플래그 캐시 (boot 시 NVS에서 1회 로드, 이후 RAM 조회)
+static bool g_battery_ignore_cache = false;
+static bool g_battery_ignore_loaded = false;
+// 배터리 CRIT 시 spiffs_cache 자동 비활성화 추적 (1회만 수행, 회복 시 리셋)
+static bool g_auto_disabled_spiffs_at_crit = false;
 
 void power_get_default_config(power_config_t* cfg) {
     if (!cfg) return;
@@ -181,18 +187,70 @@ void power_handle_idle(void) {
         (now - g_last_battery_check_ms > 60000)) {
         g_last_battery_check_ms = now;
         g_last_battery_v = power_read_battery_voltage();
+
+        // 배터리 무시 플래그 확인 (NVS에서 로드, power_init 시 캐시)
+        // true이면 임계치 도달해도 BLE 중지/딥슬립 액션 스킵
+        bool bat_ignored = power_is_battery_ignored();
+
         if (g_last_battery_v > 0 && g_last_battery_v < BC_BATTERY_V_LOW) {
-            LOGW("battery low: %.2fV", g_last_battery_v);
+            if (bat_ignored) {
+                LOGW("battery low: %.2fV (IGNORED by flag)", g_last_battery_v);
+            } else {
+                LOGW("battery low: %.2fV", g_last_battery_v);
+            }
         }
         if (g_last_battery_v > 0 && g_last_battery_v < BC_BATTERY_V_CRIT) {
-            LOGE("battery critical: %.2fV, stopping BLE activity", g_last_battery_v);
-            // TODO: BLE 끄고 딥슬립 진입 - 향후 확장
+            if (bat_ignored) {
+                LOGE("battery critical: %.2fV - BLE keep-alive forced (battery_ignore=ON)",
+                     g_last_battery_v);
+                // battery_ignore 플래그가 있으면 BLE 중지 액션 스킵
+                // 정상 동작 시 아래 TODO 라인이 활성화되어야 함
+            } else {
+                LOGE("battery critical: %.2fV, stopping BLE activity", g_last_battery_v);
+                // TODO: BLE 끄고 딥슬립 진입 - 향후 확장
+            }
+
+            // 배터리 CRIT 시 공통 액션 (battery_ignore 여부와 무관):
+            // SPIFFS 캐시 자동 비활성화 - 플래시 마모 보호
+            // 1회만 실행 (회복 시 g_auto_disabled_spiffs_at_crit 리셋)
+            if (!g_auto_disabled_spiffs_at_crit) {
+                if (storage_get_spiffs_cache_enabled()) {
+                    if (storage_set_spiffs_cache_enabled(false)) {
+                        LOGW("battery CRIT: cache spiffs OFF auto-set (flash wear protection)");
+                    }
+                }
+                g_auto_disabled_spiffs_at_crit = true;
+            }
+        } else if (g_last_battery_v > 0 && g_last_battery_v >= BC_BATTERY_V_CRIT + 0.1f) {
+            // 전압이 CRIT 위로 회복 시 자동 disable 플래그 리셋
+            // (사용자가 다시 cache spiffs on 하면 정상 동작 복귀 가능)
+            if (g_auto_disabled_spiffs_at_crit) {
+                LOGI("battery recovered above CRIT (%.2fV) - auto-disable flag reset",
+                     g_last_battery_v);
+                g_auto_disabled_spiffs_at_crit = false;
+            }
         }
     }
 
     // 라이트 슬립 진입 시도 - 1ms delay로 FreeRTOS tickless idle 트리거
     // (esp_pm_configure가 자동 처리하므로 delay만 주면 됨)
     delay(1);
+}
+
+bool power_is_battery_ignored(void) {
+    if (!g_battery_ignore_loaded) {
+        // lazy load - 첫 조회 시 storage_get_battery_ignore() 호출하여 NVS에서 로드
+        // storage_init()이 선행되어야 함
+        g_battery_ignore_cache = storage_get_battery_ignore();
+        g_battery_ignore_loaded = true;
+    }
+    return g_battery_ignore_cache;
+}
+
+void power_reload_battery_ignore(void) {
+    // 사용자가 'bat ignore on/off' 명령으로 변경 시 호출
+    // 캐시 무효화 → 다음 power_is_battery_ignored() 호출 시 NVS에서 다시 로드
+    g_battery_ignore_loaded = false;
 }
 
 void power_mark_active(void) {

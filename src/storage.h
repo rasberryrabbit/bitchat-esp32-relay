@@ -28,6 +28,8 @@ extern "C" {
 #define BC_NVS_KEY_COUNTER "ctr"
 #define BC_NVS_KEY_PEERS  "peers"
 #define BC_NVS_KEY_CONFIG "cfg"
+#define BC_NVS_KEY_BAT_IGN "bat_ign"  // 배터리 상태 무시 플래그 (uint8_t, 0/1)
+#define BC_NVS_KEY_SFF_EN  "sff_en"   // store-and-forward SPIFFS 캐시 enable (uint8_t, 0/1, 기본 1=ON)
 #define BC_MAX_PEERS       32  // 최대 캐시 피어 수
 
 typedef struct {
@@ -60,6 +62,50 @@ bool storage_has_peer(const bitchat_storage_t* st, const uint8_t* pk);
 
 // 디버그용 - Serial에 저장 상태 출력
 void storage_debug_dump(const bitchat_storage_t* st);
+
+// ----- 배터리 상태 무시 플래그 (NVS 영속화) -----
+//
+//   배터리 전압이 임계치(3.10V) 이하로 떨어져도 BLE 활동을 중지하지 않도록
+//   강제하는 플래그. USB 상시 전원 환경이나 배터리 전압 분배가 잘못된 보드,
+//   혹은 디버깅 목적으로 BLE를 계속 띄우고 싶을 때 사용.
+//
+//   상태: NVS에 uint8_t (0=off, 1=on)로 저장. 재부팅 후에도 유지.
+//   기본값: 0 (off, 정상 동작)
+//
+//   적용 지점:
+//     - power.cpp: V_CRIT 도달 시 BLE 활동 중지 액션 스킵
+//     - power.cpp: V_LOW 도달 시 경고 로그는 출력하되 조치는 취하지 않음
+//     - main.cpp: 'bat ignore on/off/status' Serial 명령으로 토글
+
+// 배터리 무시 플래그 읽기 (true=무시, false=정상)
+bool storage_get_battery_ignore(void);
+
+// 배터리 무시 플래그 설정 (NVS에 저장)
+// 성공 시 true 반환
+bool storage_set_battery_ignore(bool ignore);
+
+// ----- store-and-forward SPIFFS 캐시 enable 플래그 (NVS 영속화) -----
+//
+//   msg_cache의 RAM overflow를 SPIFFS에 영속화할지 말지를 제어.
+//   기본값: ON (SPIFFS 캐시 활성화)
+//
+//   OFF일 때 동작:
+//     - RAM 가득 차도 SPIFFS에 write 안 함 → 그냥 drop (broadcast와 동일)
+//     - 이미 SPIFFS에 있는 레코드는 부팅 시/클라이언트 접속 시 그대로 전달 (유지)
+//     - 즉, OFF는 "새로운 SPIFFS write 금지"만 의미, 기존 데이터는 유지/전달
+//
+//   ON일 때 동작 (기본):
+//     - RAM 가득 차면 가장 오래된 direct message를 SPIFFS로 overflow
+//     - 부팅 시 SPIFFS → RAM 복원
+//     - 클라이언트 접속 시 RAM + SPIFFS 모두 flush
+//
+//   사용 사례:
+//     - 플래시 수명 극단적 보호: `cache spiffs off` → SPIFFS write 0건
+//     - 배터리 부족 + SPIFFS 마모 우려 시 일시적 비활성화
+//     - 디버깅: store-and-forward 기능 자체를 끄고 싶을 때
+
+bool storage_get_spiffs_cache_enabled(void);  // 기본 true
+bool storage_set_spiffs_cache_enabled(bool enabled);
 
 #ifdef __cplusplus
 }

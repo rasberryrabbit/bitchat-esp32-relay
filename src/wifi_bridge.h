@@ -69,11 +69,26 @@ bool wifi_bridge_publish(const uint8_t* data, size_t len);
 void wifi_bridge_debug_dump(void);
 
 // WiFi 설정을 NVS에 저장 (Serial 명령 'wifi set <ssid> <pass>'에서 사용)
+// 구버전 호환용 - 실제로는 node_config_set_wifi_credentials() 호출 (SPIFFS)
 bool wifi_bridge_save_credentials(const char* ssid, const char* password);
 
 // NVS에서 WiFi 설정 조회
+// 구버전 호환용 - 실제로는 node_config_get_wifi()에서 SPIFFS 조회 (fallback으로 NVS 확인)
 bool wifi_bridge_load_credentials(char* out_ssid, size_t ssid_max,
                                    char* out_pass, size_t pass_max);
+
+// ----- MQTT 설정 (SPIFFS 영속화) -----
+// 'wifi broker <host> [port]' 명령에서 사용
+// 변경 즉시 SPIFFS(/wifi.conf)에 저장, 다음 연결 시 적용
+bool wifi_bridge_set_broker(const char* broker, uint16_t port);
+
+// 'wifi prefix <prefix>' 명령 - MQTT topic prefix 변경 (영속화)
+bool wifi_bridge_set_topic_prefix(const char* prefix);
+
+// 현재 MQTT broker 설정 반환 (캐시)
+const char* wifi_bridge_get_broker(void);
+uint16_t    wifi_bridge_get_port(void);
+const char* wifi_bridge_get_topic_prefix(void);
 
 #ifdef __cplusplus
 }

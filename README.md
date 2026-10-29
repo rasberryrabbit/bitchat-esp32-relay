@@ -38,7 +38,7 @@
 | 중복 패킷 dedup | LRU 64-슬롯 캐시로 30초 이내 중복 무시 (메시 루프 방지) |
 | TTL 감소 | 중계 시마다 TTL 1 감소, TTL=0이면 더 이상 전달 안 함 (최대 7홉) |
 | ACK 재전송 | 패시브 ACK + 명시적 ACK(type=0x02) + 타임아웃 재전송 (최대 3회) |
-| 블랙리스트 | Ed25519 공개키 + BLE 주소 차단, NVS 영속화, Serial 명령 관리 |
+| 블랙리스트 | Ed25519 공개키(256개) + BLE 주소(128개) 차단, **SPIFFS 영속화**, Serial 명령 관리 |
 | Serial UART 로그 | 115200bps로 텍스트 + 패킷 hex dump + Serial 명령 인터페이스 |
 | **배터리+절전 모드** | ESP-PM 라이트 슬립 + BLE 저듀티 + LED 펄스 + 딥슬립 (GPIO 0 wake) |
 | **NimBLE 스텍** | Bluedroid 대신 NimBLE-Arduino 사용, 메모리 1/3 절약 |
@@ -171,7 +171,11 @@ T-Beam에서는 대신:
   - **ESP32 클래식**: ESP-WROOM-32, DevKitC V4, NodeMCU-32S, Wemos D1 R32 등
   - **ESP32-C3**: DevKitM-1, Seeed XIAO ESP32C3, ESP32-C3-DevKitC-02 등
   - **ESP32-S3**: DevKitC-1, ESP32-S3-WROOM-1, Seeed XIAO ESP32S3 등
-- **플래시**: 4MB 이상 (기본 파티션 테이블 사용), S3는 8MB 표준
+- **플래시**: 4MB (기본) - 파티션 테이블 `partitions/no_ota_spiffs_1mb.csv` 사용
+  - app0 2,848KB (OTA 제거로 확장, 펌웨어 ~1.2MB → 42% 사용)
+  - SPIFFS 1024KB (블랙리스트 9KB + 1,015KB 여유, 메시지 캐시/설정 저장용)
+  - NVS 24KB (자체 키/피어/카운터 + bat_ignore 플래그), coredump 64KB
+  - S3는 8MB 표준이지만 동일 파티션 레이아웃 사용
 - **전원**: USB 5V 상시 또는 LiPo 배터리 (3.7V)
 - **추가 모듈**: 불필요 (BLE 온칩으로 충분)
 - **옵션 LoRa**: SX1276/77/78 또는 RFM95W 보드 (Heltec WiFi LoRa 32, TTGO T-Beam 등 통합 보드 자동 감지)
@@ -407,10 +411,237 @@ USB Serial Monitor에서 입력 가능한 명령:
 
 `src/blacklist.h/.cpp`에 두 가지 차단 메커니즘 구현:
 
-1. **Ed25519 공개키 블랙리스트 (32B × 32개)** - bitchat 노드 정식 식별자로 차단
-2. **BLE 주소 블랙리스트 (6B × 16개)** - advertising 단계에서 차단 (연결 시도 안 함)
+1. **Ed25519 공개키 블랙리스트 (32B × 256개)** - bitchat 노드 정식 식별자로 차단
+2. **BLE 주소 블랙리스트 (6B × 128개)** - advertising 단계에서 차단 (연결 시도 안 함)
 
-모든 블랙리스트는 NVS에 영속화되어 재부팅 후에도 유지. Serial 명령으로 실시간 add/remove 가능.
+모든 블랙리스트는 **SPIFFS 파일**(`/blacklist_pk.bin`, `/blacklist_ble.bin`)에 영속화되어 재부팅 후에도 유지. Serial 명령으로 실시간 add/remove 가능.
+
+### 백엔드 전환: NVS → SPIFFS
+
+이전 버전에서는 NVS blob으로 저장했으나 다음 한계로 인해 SPIFFS로 전환:
+- NVS blob 크기 한계 (~4KB) → pk 32개 + ble 16개가 최대
+- 매 add/remove마다 blob 전체 재기록 → flash wear 증가
+- 자체 키/피어 캐시와 동일 namespace 공유 → 충돌 위험
+
+**SPIFFS 전환 효과**:
+- 용량 8배 확장: pk 32→256개, ble 16→128개
+- 파일 단위 저장 → blob 한계 없음, 향후 메타데이터(timestamp, reason) 추가 용이
+- NVS는 자체 키/피어 영속화에만 전용 → 관심사 분리
+- SPIFFS 1,024KB 파티션 중 9KB만 사용 → 1,015KB 여유
+
+### Store-and-forward 2-tier (RAM + SPIFFS overflow)
+
+메시지 캐시는 RAM 우선, RAM이 가득 찰 때만 SPIFFS로 overflow. 플래시 수명 보호 설계.
+
+| 항목 | RAM cache (msg_cache) | SPIFFS overflow (msg_store) |
+|------|----------------------|------------------------------|
+| 용량 | 32 entries × 650B = 21KB | **3072 entries × 264B = 792KB** |
+| TTL | 12시간 (만료 시 drop) | 부팅 시 RAM으로 복원 시도 (RAM 가득 시 SPIFFS 유지) |
+| 쓰기 트리거 | 매 메시지 도착 시 (RAM 빈 슬롯) | RAM 가득 + 직접 메시지 도착 시 |
+| 패킷 크기 한계 | 650B (BITCHAT_MAX_PKT_LEN) | 256B (크면 drop) |
+| Broadcast 필터 | 모두 캐시 | broadcast는 SPIFFS에 안 씀 → drop |
+| 파일 | (RAM 구조체) | 단일 파일 `/msg_store.bin` |
+| 부팅 시 동작 | 빈 상태로 시작 | 부팅 시 scan → 다음 write slot + active count 캐싱 |
+| 부팅 시 복원 | (RAM은 휘발성) | RAM 빈 슬롯 있으면 복원, 가득 차면 SPIFFS에 유지 |
+| 쓰기 성능 | O(1) (RAM 배열) | O(1) (circular buffer, cached write slot) |
+
+**플래시 마모 최소화 전략**:
+1. **RAM 우선**: 정상 동작(클라이언트 자주 접속) 시 SPIFFS 쓰기 발생 안 함
+2. **직접 메시지만 영속화**: broadcast(브로드캐스트)는 휘발성 → RAM 꽉 차도 drop
+3. **단일 파일 + 고정 레코드**: in-place update로 fragment 최소화
+4. **3072 슬롯 순환 (circular)**: 한 슬롯에 반복 write 안 함 → wear 분산 (기존 64의 48배)
+5. **패킷 크기 한계 256B**: 큰 패킷은 어차피 RAM에 있으니 SPIFFS로 안 옮김
+6. **배터리 CRIT 자동 비활성화**: V_CRIT 도달 시 자동으로 `cache spiffs off` 전환 (아래 참고)
+
+**플래시 마모 계산** (worst case, 3072 records):
+- 4KB 섹터당 100,000 erase cycle
+- 792KB → ~198개 섹터 → 19.8M erase cycle total
+- 최악: RAM overflow 1회/분 = 19.8M 분 = 37.7년 (기존 64 슬롯일 때 347일)
+- 일반: 10 msgs/day overflow = 5,400년 (사실상 영구)
+
+**쓰기 성능 최적화** (3072 records 대응):
+- 부팅 시 1회 full scan (~200-300ms): 다음 write slot + active count 캐싱
+- 이후 `msg_store_add()`는 O(1): cached write slot에 직접 seek+write
+- `msg_store_count()`도 O(1): RAM 캐시에서 즉시 반환
+
+**동작 흐름**:
+1. 부팅 → `msg_store_init()` → SPIFFS 파일 전체 scan → 다음 write slot + active count 캐싱
+2. 부팅 → `msg_store_load_to_ram()` → RAM 빈 슬롯에 복원 시도 (최대 32개)
+   - 복원 성공한 레코드 → SPIFFS에서 inactive 마킹
+   - RAM 가득 차서 못 넣은 레코드 → SPIFFS에 그대로 유지 (나중에 flush 시 전달)
+3. 메시지 도착, 클라이언트 없음 → `msg_cache_add()`:
+   - RAM 빈 슬롯 있으면 RAM에 추가
+   - RAM 가득 찼으면 가장 오래된 entry를 `msg_store_add()`로 SPIFFS에 밀어냄
+4. 클라이언트 접속 (2초 후) → `msg_cache_flush(notify_fn)`:
+   - RAM의 모든 active entry를 callback으로 방출 (BLE notify)
+   - SPIFFS의 모든 레코드도 callback으로 방출
+   - SPIFFS 파일 truncate + 캐시 초기화
+
+**Serial 명령**:
+```text
+cache               # RAM + SPIFFS 상태 출력
+cache dump          # 각 슬롯 상세 출력
+cache clear         # SPIFFS overflow 파일 강제 삭제
+cache spiffs        # SPIFFS 캐시 enable 플래그 상태 출력
+cache spiffs on     # SPIFFS overflow 활성화 (기본값, NVS 영속화)
+cache spiffs off    # SPIFFS overflow 비활성화 (drop only, NVS 영속화)
+```
+
+**`cache spiffs off` 동작**:
+- RAM overflow 발생 시 SPIFFS에 write하지 않고 drop만 (플래시 마모 0건)
+- 이미 SPIFFS에 있는 레코드는 유지 → 부팅 시 RAM으로 복원, 클라이언트 접속 시 flush됨
+- 즉 "새로운 SPIFFS write 금지"만 의미, 기존 데이터는 그대로 전달
+- 배터리 부족/플래시 수명 극단 보호/디버깅 시 사용
+
+**`cache spiffs on` 동작** (기본값):
+- 정상 동작 복귀, RAM overflow → SPIFFS write 발생
+
+**배터리 CRIT 자동 비활성화**:
+- `power_handle_idle()`이 배터리 전압을 1분마다 측정
+- V_CRIT (3.10V) 이하로 떨어지면 자동으로 `cache spiffs off` 전환
+  - 1회만 실행 (g_auto_disabled_spiffs_at_crit 플래그로 추적)
+  - 전압이 CRIT+0.1V 이상으로 회복되면 플래그 리셋 → 다음 CRIT 시 다시 자동 비활성화 가능
+- `battery_ignore` 플래그 여부와 무관하게 동작 (BLE는 살려두더라도 SPIFFS write는 막음)
+- 로그: `[W] battery CRIT: cache spiffs OFF auto-set (flash wear protection)`
+- 사용자가 명시적으로 `cache spiffs on`으로 다시 켤 수 있음 (회복 후)
+
+**적용 시나리오**:
+- 일반 운영: 클라이언트가 자주 접속 → RAM 캐시로 충분, SPIFFS는 비어 있음
+- 장기 단절 (12시간+): RAM 32개 꽉 참 → overflow direct messages가 SPIFFS로 영속화
+- 재부팅 후 클라이언트 접속 → SPIFFS → RAM 복원 → 클라이언트에게 모두 전달
+
+---
+
+## 노드 프로필 + WiFi/MQTT 설정 (SPIFFS config files)
+
+노드 닉네임과 WiFi/MQTT 설정을 SPIFFS 파일(`key=value` 포맷)로 영속화. 기존 NVS 기반 WiFi 자격증명은 부팅 시 자동 마이그레이션 후 SPIFFS로 이관.
+
+### 설정 파일 2개 (SPIFFS 루트)
+
+**`/node.conf`** - 노드 프로필:
+```
+# bitchat relay node profile
+nickname=MyRelayNode
+```
+
+**`/wifi.conf`** - WiFi + MQTT 설정:
+```
+# bitchat relay wifi/mqtt config
+ssid=MyHomeWiFi
+pass=password123
+broker=test.mosquitto.org
+port=1883
+topic_prefix=bchat
+```
+
+### Serial 명령
+
+```text
+# 노드 프로필
+node                     # 현재 nickname + self_id 출력
+node nick <name>         # nickname 설정 (SPIFFS 영속화, 재부팅 필요)
+node nick clear          # nickname 제거
+
+# WiFi/MQTT 설정
+wifi set <ssid> <pass>   # WiFi 자격증명 (이제 SPIFFS에 저장)
+wifi broker <host> [p]   # MQTT broker + port (이제 실제 동작, SPIFFS 영속화)
+wifi prefix <prefix>     # MQTT topic prefix (SPIFFS 영속화)
+```
+
+### 백엔드 전환: NVS → SPIFFS
+
+| 항목 | 이전 (NVS) | 현재 (SPIFFS) |
+|------|-----------|----------------|
+| WiFi ssid/pass | NVS blob (bwifi namespace) | `/wifi.conf` 파일 |
+| MQTT broker | 컴파일 타임 매크로만 | `/wifi.conf`의 `broker` 키 |
+| MQTT port | 컴파일 타임 매크로만 | `/wifi.conf`의 `port` 키 |
+| MQTT prefix | 컴파일 타임 매크로만 | `/wifi.conf`의 `topic_prefix` 키 |
+| 노드 nickname | (미지원) | `/node.conf`의 `nickname` 키 |
+
+**장점**:
+- 사람이 읽기 쉬운 텍스트 포맷 (cat /wifi.conf 가능)
+- 모든 설정이 한 곳에 → 백업/마이그레이션 용이
+- NVS는 자체 키/피어 영속화에만 전용 → 관심사 분리
+- nickname → BLE 광고 이름 자동 반영 (`bitchat-<nick>` 또는 `bitchat`)
+
+**자동 마이그레이션** (1회):
+- 부팅 시 SPIFFS에 `/wifi.conf`가 없고 NVS에 ssid가 있으면 자동 이관
+- 이관 후 NVS에서 ssid/pass 삭제 → 다음 부팅부터 SPIFFS-only
+
+### nickname 활용
+
+```text
+> node nick MyRelay
+> node
+=== node profile ===
+self_id=8a3f2c1b...
+nickname=MyRelay
+ble_adv_name=bitchat-<nick>
+(file: /node.conf)
+
+[재부팅 후]
+BLE advertising started as bitchat-MyRelay (NimBLE)
+```
+
+- BLE 스캐너가 다른 bitchat 노드와 구분 가능
+- 여러 릴레이 운영 시 식별 용이 (예: `bitchat-LivingRoom`, `bitchat-Balcony`)
+- 빈 nickname이면 기본값 `bitchat` (기존 동작 유지)
+
+### 플래시 수명
+
+- 설정 파일 변경 시에만 SPIFFS write (Serial 명령 입력 시)
+- 일반 사용자: 설정 1-2회/월 변경 → 사실상 마모 무시
+- `/node.conf` ~50B, `/wifi.conf` ~150B → SPIFFS 1MB 중 0.02% 사용
+
+---
+
+### 플래시 파티션 레이아웃 (4MB)
+
+```
+Offset    Size      Partition      용도
+0x000000  ~32KB     bootloader     1st stage bootloader
+0x008000  4KB       partition tbl  파티션 테이블
+0x009000  24KB      nvs            자체 키/피어/카운터 + bat_ignore 플래그 (storage.cpp)
+0x00F000  (padding)
+0x010000  2,848KB   app0           펌웨어 (현재 ~1.2MB, 42% 사용)
+0x2F0000  1,024KB   spiffs         블랙리스트 9KB + 1,015KB 여유 (메시지 캐시/설정)
+0x3F0000  64KB      coredump       크래시 분석
+```
+
+OTA 파티션(app1) 제거 + SPIFFS 1MB 확장. app0는 default.csv의 1,280KB 대비 2.22배.
+
+---
+
+## 배터리 무시 명령 (bat ignore)
+
+배터리 전압이 임계치(3.40V LOW, 3.10V CRIT) 이하로 떨어질 때 자동으로 취해지는 액션(BLE 중지, 딥슬립)을 강제로 무시하는 플래그.
+
+### Serial 명령
+
+```text
+bat                    # 현재 전압 + ignore 플래그 상태 출력
+bat status             # 위와 동일 (alias)
+bat ignore            # ignore 플래그 상태만 출력
+bat ignore on         # 강제 BLE keep-alive (CRIT 도달해도 중지 안 함, NVS 영속화)
+bat ignore off        # 정상 동작으로 복귀 (NVS 영속화)
+bat read              # ADC에서 전압 1회 즉시 읽기
+```
+
+### 작동 방식
+
+1. **플래그 저장**: NVS namespace `bchat`의 `bat_ign` 키에 `uint8_t` (0/1)로 저장
+2. **재부팅 시 자동 적용**: `power_is_battery_ignored()`가 boot 시 NVS에서 lazy-load → `power_handle_idle()`의 배터리 측정 루틴에서 조회
+3. **캐시 무효화**: `bat ignore on/off` 실행 즉시 `power_reload_battery_ignore()` 호출 → 다음 번 측정부터 새 값 적용
+4. **영향 받는 동작**:
+   - `power.cpp`: V_CRIT 도달 시 "BLE 중지 + 딥슬립" 액션 스킵 (현재 TODO 라인)
+   - V_LOW 경고 로그는 그대로 출력 (단 "IGNORED by flag" 접미사 추가)
+
+### 사용 사례
+
+- **USB 상시 전원 환경**에서 배터리 분배 핀이 있어 가짜 CRIT 전압이 읽히는 경우 → `bat ignore on`
+- **Heltec WiFi LoRa 32 V2**에서 GPIO 13 (ADC2)이 WiFi bridge 켜지면 garbage 값 읽어 CRIT 오탐지 → `bat ignore on`으로 회피 (BLE-only 운영에서는 정상 측정 가능하므로 off 유지 권장)
+- **TTGO T-Beam**은 AXP192 PMU 경유라 ADC disabled → bat_ignore 플래그 의미 없음
+- **배터리 없는 DevKitC**에서도 ADC pin이 floating 상태면 잘못된 값 읽힐 수 있으므로 `bat ignore on` 권장
 
 ---
 
@@ -427,13 +658,17 @@ USB Serial Monitor에서 입력 가능한 명령:
 | 모든 보드 동시 연결 | 4-7 (SRAM 제약) | 8-9 (heap 여유) | 안전 마진 1개 |
 | BLE 5.0 | 미지원 (4.2 클래식) | 지원 | Extended adv 등 (C3/S3) |
 
-### 빌드 크기 비교 (NimBLE + LoRa + WiFi 포함, 배터리 모드)
+### 빌드 크기 비교 (NimBLE + LoRa + WiFi + SPIFFS 블랙리스트 + bat_ignore 포함, 배터리 모드)
 
-| 보드 | RAM | Flash | 비고 |
-|------|-----|-------|------|
-| ESP32 클래식 | 22.3% (73KB) | 92.2% (1.21MB) | ⚠️ huge_app partition 권장 |
-| ESP32-C3 | 19.6% (64KB) | 86.7% (1.14MB) | 안정적 |
-| ESP32-S3 | 21.6% (71KB) | 84.0% (1.10MB) | 가장 여유 (8MB Flash) |
+> 파티션 테이블 `partitions/no_ota_spiffs_1mb.csv` 적용 기준 (app0=2,848KB, SPIFFS=1,024KB)
+
+| 보드 | RAM | Flash | app0 사용률 | 비고 |
+|------|-----|-------|-------------|------|
+| ESP32 클래식 | 37.3% (122KB) | 1,248KB | **43.8%** (app0 2,848KB) | OTA 제거로 2.22배 여유 |
+| ESP32-C3 | 34.4% (113KB) | 1,221KB | **42.9%** (app0 2,848KB) | OTA 제거로 2.22배 여유 |
+| ESP32-S3 | 36.5% (119KB) | 1,139KB | **40.0%** (app0 2,848KB) | 가장 여유 (8MB Flash) |
+
+이전 (default.csv, app0=1,280KB) 대비 app0 여유 약 2.7배 확보 + SPIFFS 1MB 추가.
 
 ---
 
@@ -687,7 +922,7 @@ CONFIG_ESP32_WIFI_SOFTAP_SUPPORT=n   # STA만 사용
 
 - **평문 MQTT** (1883 포트) - TLS 인증서 미지원 (간단함 우선)
 - **WiFi 자동 연결 안 함**: 사용자가 명시적으로 `wifi on` 필요 (BLE 우선 정책)
-- **ESP32 클래식 Flash 92.2%** - WiFi 활성화로 Flash 증가, `huge_app.csv` partition 권장
+- ~~ESP32 클래식 Flash 92.2%~~ → **해결**: `partitions/no_ota_spiffs_1mb.csv` 적용으로 app0 2,848KB 확보, 현재 사용률 43.8% (SPIFFS 1MB 추가)
 
 ---
 
@@ -697,6 +932,9 @@ CONFIG_ESP32_WIFI_SOFTAP_SUPPORT=n   # STA만 사용
 bitchat-esp32-relay/
 ├── README.md                      # 이 파일
 ├── platformio.ini                 # PlatformIO 빌드 (9 envs: esp32dev/c3/s3 + USB 변형 + heltec_v2/t-beam)
+├── partitions/                    # 사용자 정의 파티션 테이블
+│   ├── no_ota_spiffs_1mb.csv      # OTA 제거 + app0 2.8MB + SPIFFS 1MB (현재 사용)
+│   └── no_ota_max_app_spiffs.csv  # OTA 제거 + app0 3.6MB + SPIFFS 128KB (백업)
 ├── CMakeLists.txt                 # ESP-IDF 루트
 ├── sdkconfig.defaults             # ESP-IDF 기본 (ESP32 공통 + PM/tickless + BLE coex)
 ├── sdkconfig.defaults.esp32c3     # ESP-IDF C3 전용 오버라이드
@@ -710,9 +948,12 @@ bitchat-esp32-relay/
 │   ├── storage.h/.cpp             # NVS 키/피어 영속화
 │   ├── power.h/.cpp               # ESP-PM 라이트 슬립 + 배터리 ADC + LED 펄스
 │   ├── retry_queue.h/.cpp         # ACK 재전송 (패시브 ACK + 타임아웃)
-│   ├── blacklist.h/.cpp           # pk/BLE 주소 블랙리스트 (NVS 영속화)
+│   ├── blacklist.h/.cpp           # pk(256)/BLE(128) 블랙리스트 (SPIFFS 영속화)
 │   ├── lora_relay.h/.cpp          # LoRa 자동감지 + BLE↔LoRa 브릿지 (SX127x)
 │   ├── packet_splitter.h/.cpp     # 큰 패킷 분할/재조립 (LoRa 222B 한계 우회)
+│   ├── msg_cache.h/.cpp          # store-and-forward RAM 캐시 (32 entries, 12h TTL)
+│   ├── msg_store.h/.cpp          # SPIFFS overflow backend (64 entries, /msg_store.bin)
+│   ├── node_config.h/.cpp        # SPIFFS config files (/node.conf, /wifi.conf)
 │   ├── wifi_bridge.h/.cpp         # WiFi+MQTT 브릿지 (BLE↔인터넷, Serial on/off)
 │   └── ble_relay.h/.cpp           # BLE GATT + relay (NimBLE, 배터리 모드 시 저듀티)
 ├── lib/                           # 외부 라이브러리 (자체 포함)
@@ -755,7 +996,7 @@ bitchat-esp32-relay/
 
 ## 제한사항
 
-- **ESP32 클래식 Flash 92.2%** - WiFi 활성화로 위험 수준. `huge_app.csv` 파티션 전환 권장
+- ~~ESP32 클래식 Flash 92.2%~~ → **해결**: OTA 제거 + SPIFFS 1MB 확장 파티션 적용으로 app0 2,848KB (43.8% 사용), SPIFFS 1MB 추가
 - **C3/S3/Classic 모두 BLE 동시 연결 8개** (NimBLE max=9 + 앱 1 headroom)
 - **ESP32 BLE 컨트롤러 하드 한계 9개** - 10+ 연결 필요 시 다중 ESP32 분산
 - **Ed25519 검증 속도**: 클래식/S3 ~30ms (듀얼코어 240MHz), C3 ~60-80ms (싱글코어 160MHz)

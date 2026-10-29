@@ -115,6 +115,20 @@ void power_battery_debug(void);
 // 주의: 딥슬립 중에는 BLE 끊김, RAM 초기화됨 (RTC 메모리만 유지)
 void power_enter_deep_sleep(uint64_t sleep_us);
 
+// ----- 배터리 무시 플래그 (NVS 영속화된 상태 조회) -----
+//
+//   NVS에 저장된 'bat_ign' 키를 lazy-load하여 반환.
+//   true: 배터리 임계치 도달해도 BLE 중지/딥슬립 액션 스킵
+//   false: 정상 동작 (V_CRIT 시 BLE 중지)
+//
+//   캐시: 첫 호출 시 NVS에서 로드, 이후 RAM에서 반환.
+//   변경 감지: power_reload_battery_ignore() 호출 시 캐시 무효화.
+bool power_is_battery_ignored(void);
+
+// 배터리 무시 플래그 캐시 무효화 - 'bat ignore on/off' 명령 후 호출
+// 다음 power_is_battery_ignored() 시 NVS에서 다시 로드
+void power_reload_battery_ignore(void);
+
 #ifdef __cplusplus
 }
 #endif

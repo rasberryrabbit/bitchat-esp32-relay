@@ -1,27 +1,37 @@
 /*
- * blacklist.cpp - 블랙리스트 필터링 구현
+ * blacklist.cpp - 블랙리스트 필터링 구현 (SPIFFS 백엔드)
  *
  * 한국어:
- *   pk(32B) 32개 + BLE(6B) 16개를 NVS blob으로 영속화.
- *   - PK: active flag + 32B = 33B × 32 = 1,056B blob
- *   - BLE: active flag + 6B = 7B × 16 = 112B blob
- *   add 시 자동 NVS commit, init 시 NVS에서 load.
+ *   pk(32B) 256개 + BLE(6B) 128개를 SPIFFS 파일로 영속화.
+ *   - PK 파일: /blacklist_pk.bin   256 × 33B = 8,448B
+ *   - BLE 파일: /blacklist_ble.bin 128 × 7B  =   896B
+ *
+ *   구조:
+ *     pk_entry_t  = { uint8_t active; uint8_t pk[32]; }    // 33B
+ *     ble_entry_t = { uint8_t active; uint8_t addr[6]; }   // 7B
+ *
+ *   동작:
+ *     - init(): SPIFFS에서 두 파일 로드 (없으면 빈 파일 생성)
+ *     - add/remove: RAM 배열 갱신 후 통째로 SPIFFS에 저장
+ *     - clear: RAM 초기화 + 파일 삭제
+ *
+ *   SPIFFS vs NVS 장점:
+ *     - 용량 8배 확장 (32→256 pk, 16→128 ble)
+ *     - 파일 단위 저장 → blob 4KB 한계 없음
+ *     - NVS는 자체 키/피어/카운터 전용으로 분리
  */
 
 #include "blacklist.h"
 #include "log.h"
 #include "bitchat_protocol.h"   // BITCHAT_PUBKEY_LEN
 
-#include <nvs.h>
-#include <nvs_flash.h>
+#include <Arduino.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <string.h>
 #include <stdio.h>
 
-#define BC_BL_NVS_NAMESPACE "bchatbl"
-#define BC_BL_NVS_KEY_PKS   "pks"
-#define BC_BL_NVS_KEY_BLES  "bles"
-
-// 직렬화 포맷: [active:1B][pk:32B] × 32 = 1,056B
+// 직렬화 포맷: [active:1B][pk:32B] × N
 typedef struct {
     uint8_t active;
     uint8_t pk[32];
@@ -39,59 +49,127 @@ static bool g_init_done = false;
 static size_t g_pk_count = 0;
 static size_t g_ble_count = 0;
 
-// NVS에 저장
-static void persist_to_nvs(void) {
-    nvs_handle_t h;
-    if (nvs_open(BC_BL_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_blob(h, BC_BL_NVS_KEY_PKS,  g_pk_entries,  sizeof(g_pk_entries));
-    nvs_set_blob(h, BC_BL_NVS_KEY_BLES, g_ble_entries, sizeof(g_ble_entries));
-    nvs_commit(h);
-    nvs_close(h);
+// SPIFFS에 파일 저장 (통째로 write)
+// RAM 배열 → 파일 동기화. 호출 시마다 전체 파일 재작성.
+static bool persist_pk_to_spiffs(void) {
+    File f = SPIFFS.open(BC_BL_PK_FILE, "w");
+    if (!f) {
+        LOGE("blacklist: failed to open %s for write", BC_BL_PK_FILE);
+        return false;
+    }
+    size_t written = f.write((const uint8_t*)g_pk_entries, sizeof(g_pk_entries));
+    f.close();
+    if (written != sizeof(g_pk_entries)) {
+        LOGE("blacklist: pk write short: %u/%u",
+             (unsigned)written, (unsigned)sizeof(g_pk_entries));
+        return false;
+    }
+    return true;
 }
 
-// NVS에서 로드
-static void load_from_nvs(void) {
-    nvs_handle_t h;
-    if (nvs_open(BC_BL_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        LOGI("blacklist: no NVS data, starting empty");
-        return;
+static bool persist_ble_to_spiffs(void) {
+    File f = SPIFFS.open(BC_BL_BLE_FILE, "w");
+    if (!f) {
+        LOGE("blacklist: failed to open %s for write", BC_BL_BLE_FILE);
+        return false;
     }
-    size_t pk_sz = sizeof(g_pk_entries);
-    size_t ble_sz = sizeof(g_ble_entries);
-    esp_err_t e1 = nvs_get_blob(h, BC_BL_NVS_KEY_PKS,  g_pk_entries,  &pk_sz);
-    esp_err_t e2 = nvs_get_blob(h, BC_BL_NVS_KEY_BLES, g_ble_entries, &ble_sz);
-    nvs_close(h);
+    size_t written = f.write((const uint8_t*)g_ble_entries, sizeof(g_ble_entries));
+    f.close();
+    if (written != sizeof(g_ble_entries)) {
+        LOGE("blacklist: ble write short: %u/%u",
+             (unsigned)written, (unsigned)sizeof(g_ble_entries));
+        return false;
+    }
+    return true;
+}
 
-    // 카운트 계산
-    g_pk_count = 0;
-    if (e1 == ESP_OK) {
-        for (int i = 0; i < BC_BL_MAX_PK_ENTRIES; ++i) {
-            if (g_pk_entries[i].active) g_pk_count++;
-        }
-    } else {
+// SPIFFS에서 파일 로드
+static bool load_pk_from_spiffs(void) {
+    if (!SPIFFS.exists(BC_BL_PK_FILE)) {
+        LOGI("blacklist: %s not found, starting empty", BC_BL_PK_FILE);
         memset(g_pk_entries, 0, sizeof(g_pk_entries));
+        return false;
+    }
+    File f = SPIFFS.open(BC_BL_PK_FILE, "r");
+    if (!f) {
+        LOGE("blacklist: failed to open %s for read", BC_BL_PK_FILE);
+        memset(g_pk_entries, 0, sizeof(g_pk_entries));
+        return false;
+    }
+    size_t got = f.readBytes((char*)g_pk_entries, sizeof(g_pk_entries));
+    f.close();
+    if (got != sizeof(g_pk_entries)) {
+        LOGW("blacklist: pk file truncated (%u/%u), padding zeros",
+             (unsigned)got, (unsigned)sizeof(g_pk_entries));
+        // 부분 로드 시 나머지 0으로 채움
+        if (got < sizeof(g_pk_entries)) {
+            memset((uint8_t*)g_pk_entries + got, 0, sizeof(g_pk_entries) - got);
+        }
+    }
+    return true;
+}
+
+static bool load_ble_from_spiffs(void) {
+    if (!SPIFFS.exists(BC_BL_BLE_FILE)) {
+        LOGI("blacklist: %s not found, starting empty", BC_BL_BLE_FILE);
+        memset(g_ble_entries, 0, sizeof(g_ble_entries));
+        return false;
+    }
+    File f = SPIFFS.open(BC_BL_BLE_FILE, "r");
+    if (!f) {
+        LOGE("blacklist: failed to open %s for read", BC_BL_BLE_FILE);
+        memset(g_ble_entries, 0, sizeof(g_ble_entries));
+        return false;
+    }
+    size_t got = f.readBytes((char*)g_ble_entries, sizeof(g_ble_entries));
+    f.close();
+    if (got != sizeof(g_ble_entries)) {
+        LOGW("blacklist: ble file truncated (%u/%u), padding zeros",
+             (unsigned)got, (unsigned)sizeof(g_ble_entries));
+        if (got < sizeof(g_ble_entries)) {
+            memset((uint8_t*)g_ble_entries + got, 0, sizeof(g_ble_entries) - got);
+        }
+    }
+    return true;
+}
+
+static void recount_entries(void) {
+    g_pk_count = 0;
+    for (int i = 0; i < BC_BL_MAX_PK_ENTRIES; ++i) {
+        if (g_pk_entries[i].active) g_pk_count++;
     }
     g_ble_count = 0;
-    if (e2 == ESP_OK) {
-        for (int i = 0; i < BC_BL_MAX_BLE_ENTRIES; ++i) {
-            if (g_ble_entries[i].active) g_ble_count++;
-        }
-    } else {
-        memset(g_ble_entries, 0, sizeof(g_ble_entries));
+    for (int i = 0; i < BC_BL_MAX_BLE_ENTRIES; ++i) {
+        if (g_ble_entries[i].active) g_ble_count++;
     }
-    LOGI("blacklist: loaded %u pk + %u ble from NVS",
-         (unsigned)g_pk_count, (unsigned)g_ble_count);
 }
 
 bool blacklist_init(void) {
     if (g_init_done) return true;
+
+    // SPIFFS 마운트 확인 (main.cpp에서 SPIFFS.begin(true) 선행 필요)
+    if (!SPIFFS.begin(true)) {
+        LOGE("blacklist: SPIFFS mount failed, blacklist disabled");
+        return false;
+    }
+
     memset(g_pk_entries, 0, sizeof(g_pk_entries));
     memset(g_ble_entries, 0, sizeof(g_ble_entries));
-    load_from_nvs();
+
+    load_pk_from_spiffs();
+    load_ble_from_spiffs();
+    recount_entries();
+
     g_init_done = true;
     g_enabled = true;
-    LOGI("blacklist: initialized (enabled=%d, pk=%u, ble=%u)",
-         g_enabled, (unsigned)g_pk_count, (unsigned)g_ble_count);
+    LOGI("blacklist: initialized from SPIFFS (enabled=%d, pk=%u/%u, ble=%u/%u)",
+         g_enabled,
+         (unsigned)g_pk_count,  BC_BL_MAX_PK_ENTRIES,
+         (unsigned)g_ble_count, BC_BL_MAX_BLE_ENTRIES);
+    LOGI("blacklist: SPIFFS usage: pk=%uB + ble=%uB (of %uB partition)",
+         (unsigned)sizeof(g_pk_entries),
+         (unsigned)sizeof(g_ble_entries),
+         (unsigned)128 * 1024);
     return true;
 }
 
@@ -116,15 +194,16 @@ bool blacklist_add_pk(const uint8_t* pk) {
             g_pk_entries[i].active = 1;
             memcpy(g_pk_entries[i].pk, pk, 32);
             g_pk_count++;
-            persist_to_nvs();
+            persist_pk_to_spiffs();
             char id[BITCHAT_ID_STR_LEN];
             bitchat_id_from_pk(pk, id);
-            LOGI("blacklist: added pk id=%s (slot %d, total=%u)",
-                 id, i, (unsigned)g_pk_count);
+            LOGI("blacklist: added pk id=%s (slot %d, total=%u/%u)",
+                 id, i, (unsigned)g_pk_count, BC_BL_MAX_PK_ENTRIES);
             return true;
         }
     }
-    LOGW("blacklist: pk full (%u), cannot add", (unsigned)g_pk_count);
+    LOGW("blacklist: pk full (%u/%u), cannot add",
+         (unsigned)g_pk_count, BC_BL_MAX_PK_ENTRIES);
     return false;
 }
 
@@ -134,12 +213,13 @@ bool blacklist_remove_pk(const uint8_t* pk) {
         if (g_pk_entries[i].active &&
             memcmp(g_pk_entries[i].pk, pk, 32) == 0) {
             g_pk_entries[i].active = 0;
+            memset(g_pk_entries[i].pk, 0, 32);
             g_pk_count--;
-            persist_to_nvs();
+            persist_pk_to_spiffs();
             char id[BITCHAT_ID_STR_LEN];
             bitchat_id_from_pk(pk, id);
-            LOGI("blacklist: removed pk id=%s (total=%u)",
-                 id, (unsigned)g_pk_count);
+            LOGI("blacklist: removed pk id=%s (total=%u/%u)",
+                 id, (unsigned)g_pk_count, BC_BL_MAX_PK_ENTRIES);
             return true;
         }
     }
@@ -148,6 +228,8 @@ bool blacklist_remove_pk(const uint8_t* pk) {
 
 bool blacklist_is_pk_blocked(const uint8_t* pk) {
     if (!g_init_done || !g_enabled || !pk) return false;
+    // 256개라 linear scan도 충분 (~8μs @ 240MHz)
+    // 필요시 정렬 + binary search로 최적화 가능
     for (int i = 0; i < BC_BL_MAX_PK_ENTRIES; ++i) {
         if (g_pk_entries[i].active &&
             memcmp(g_pk_entries[i].pk, pk, 32) == 0) {
@@ -168,7 +250,7 @@ bool blacklist_add_ble(const uint8_t* addr) {
             g_ble_entries[i].active = 1;
             memcpy(g_ble_entries[i].addr, addr, 6);
             g_ble_count++;
-            persist_to_nvs();
+            persist_ble_to_spiffs();
             char hex[13];
             static const char* h = "0123456789abcdef";
             for (int j = 0; j < 6; ++j) {
@@ -176,12 +258,13 @@ bool blacklist_add_ble(const uint8_t* addr) {
                 hex[j * 2 + 1] = h[addr[j] & 0xF];
             }
             hex[12] = 0;
-            LOGI("blacklist: added ble %s (slot %d, total=%u)",
-                 hex, i, (unsigned)g_ble_count);
+            LOGI("blacklist: added ble %s (slot %d, total=%u/%u)",
+                 hex, i, (unsigned)g_ble_count, BC_BL_MAX_BLE_ENTRIES);
             return true;
         }
     }
-    LOGW("blacklist: ble full (%u), cannot add", (unsigned)g_ble_count);
+    LOGW("blacklist: ble full (%u/%u), cannot add",
+         (unsigned)g_ble_count, BC_BL_MAX_BLE_ENTRIES);
     return false;
 }
 
@@ -191,8 +274,9 @@ bool blacklist_remove_ble(const uint8_t* addr) {
         if (g_ble_entries[i].active &&
             memcmp(g_ble_entries[i].addr, addr, 6) == 0) {
             g_ble_entries[i].active = 0;
+            memset(g_ble_entries[i].addr, 0, 6);
             g_ble_count--;
-            persist_to_nvs();
+            persist_ble_to_spiffs();
             return true;
         }
     }
@@ -217,23 +301,29 @@ void blacklist_clear_all(void) {
     memset(g_ble_entries, 0, sizeof(g_ble_entries));
     g_pk_count = 0;
     g_ble_count = 0;
-    persist_to_nvs();
-    LOGI("blacklist: cleared all");
+    // SPIFFS에서도 파일 삭제
+    SPIFFS.remove(BC_BL_PK_FILE);
+    SPIFFS.remove(BC_BL_BLE_FILE);
+    LOGI("blacklist: cleared all (SPIFFS files removed)");
 }
 
 size_t blacklist_get_pk_count(void)  { return g_pk_count; }
 size_t blacklist_get_ble_count(void) { return g_ble_count; }
 
 void blacklist_debug_dump(void) {
-    LOGI("=== blacklist dump (enabled=%d) ===", g_enabled);
-    LOGI("pk entries: %u/%u", (unsigned)g_pk_count, BC_BL_MAX_PK_ENTRIES);
+    LOGI("=== blacklist dump (enabled=%d, SPIFFS backend) ===", g_enabled);
+    LOGI("pk entries: %u/%u (file: %s, %uB)",
+         (unsigned)g_pk_count, BC_BL_MAX_PK_ENTRIES,
+         BC_BL_PK_FILE, (unsigned)sizeof(g_pk_entries));
     for (int i = 0; i < BC_BL_MAX_PK_ENTRIES; ++i) {
         if (!g_pk_entries[i].active) continue;
         char id[BITCHAT_ID_STR_LEN];
         bitchat_id_from_pk(g_pk_entries[i].pk, id);
-        LOGI("  pk[%02d] id=%s", i, id);
+        LOGI("  pk[%03d] id=%s", i, id);
     }
-    LOGI("ble entries: %u/%u", (unsigned)g_ble_count, BC_BL_MAX_BLE_ENTRIES);
+    LOGI("ble entries: %u/%u (file: /blacklist_ble.bin, %uB)",
+         (unsigned)g_ble_count, BC_BL_MAX_BLE_ENTRIES,
+         (unsigned)sizeof(g_ble_entries));
     for (int i = 0; i < BC_BL_MAX_BLE_ENTRIES; ++i) {
         if (!g_ble_entries[i].active) continue;
         char hex[13];
@@ -243,8 +333,14 @@ void blacklist_debug_dump(void) {
             hex[j * 2 + 1] = h[g_ble_entries[i].addr[j] & 0xF];
         }
         hex[12] = 0;
-        LOGI("  ble[%02d] %s", i, hex);
+        LOGI("  ble[%03d] %s", i, hex);
     }
+    // SPIFFS 전체 사용량 표시 (arduino-esp32 v2.x: totalBytes()/usedBytes())
+    size_t total = SPIFFS.totalBytes();
+    size_t used  = SPIFFS.usedBytes();
+    LOGI("spiffs: used=%uB / total=%uB (%.1f%%)",
+         (unsigned)used, (unsigned)total,
+         total > 0 ? 100.0f * used / total : 0.0f);
 }
 
 size_t blacklist_hex_to_bytes(const char* hex, uint8_t* out, size_t out_max) {

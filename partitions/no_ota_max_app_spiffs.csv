@@ -1,0 +1,21 @@
+# ESP32 파티션 테이블 - NO OTA, MAX app0, SMALL SPIFFS (블랙리스트 저장용)
+# 4MB Flash 기준:
+#   app0:   3,632,128 bytes (3,547 KB, 3.46 MB) - default.csv(1,280KB) 대비 2.84배
+#   spiffs:    131,072 bytes (  128 KB)         - 블랙리스트 + 여유
+#   nvs:        24,576 bytes (   24 KB)          - 자체 키/피어 캐시/카운터
+#   coredump:   65,536 bytes (   64 KB)         - 크래시 분석
+#
+# 이 파티션 테이블을 사용하려면 platformio.ini에서:
+#   board_build.partitions = partitions/no_ota_max_app_spiffs.csv
+#
+# 설계 의도:
+#   - OTA 미구현 → app1 슬롯 제거 (1,280KB 절약)
+#   - SPIFFS는 블랙리스트 저장 용도로만 사용 → 128KB면 충분
+#     (블랙리스트: pk 256개×33B + ble 128개×7B = 9.4KB, 여유 118KB)
+#   - 절약된 공간을 app0로 할당 → 향후 mesh routing, 메시지 캐시 등 추가 가능
+#
+# Name,     Type, SubType,  Offset,   Size,    Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+app0,       app,  ota_0,    0x10000,  0x370000,
+spiffs,     data, spiffs,   0x380000, 0x020000,
+coredump,   data, coredump, 0x3F0000, 0x010000,

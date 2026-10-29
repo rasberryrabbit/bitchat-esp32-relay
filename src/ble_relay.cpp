@@ -19,6 +19,7 @@
 #include "wifi_bridge.h"
 #include "peer_keys.h"   // senderID → Ed25519 pk 매핑
 #include "msg_cache.h"    // store-and-forward 메시지 캐시
+#include "node_config.h"  // nickname → BLE adv name
 
 #include <cstring>
 #include <algorithm>
@@ -180,7 +181,14 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     }
 
     // NimBLE 디바이스 초기화
-    NimBLEDevice::init(BC_BLE_ADV_NAME);
+    // nickname이 설정되어 있으면 "bitchat-<nick>" 형식으로 광고
+    // 그렇지 않으면 기본 "bitchat"
+    char adv_name[8 + MAX_NICKNAME_LEN + 1] = "bitchat";
+    const char* nick = node_config_get_nickname();
+    if (nick && nick[0]) {
+        snprintf(adv_name, sizeof(adv_name), "bitchat-%s", nick);
+    }
+    NimBLEDevice::init(adv_name);
     NimBLEDevice::setMTU(247);  // NimBLE 기본 MTU 247 (Bluedroid 517과 다름)
     // NimBLE는 setMTU만으로 client와 server 모두에 적용됨
 

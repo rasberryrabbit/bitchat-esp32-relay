@@ -13,6 +13,7 @@
  */
 
 #include <Arduino.h>
+#include <SPIFFS.h>
 #include "log.h"
 #include "crypto.h"
 #include "storage.h"
@@ -26,6 +27,8 @@
 #include "peer_keys.h"   // senderID → Ed25519 pk 매핑 (서명 검증용)
 #include "packet_splitter.h"   // 큰 패킷 분할/재조립 - LoRa 메시 전용
 #include "msg_cache.h"          // store-and-forward 메시지 캐시
+#include "msg_store.h"          // SPIFFS overflow backend for msg_cache
+#include "node_config.h"        // SPIFFS-based node profile + wifi/mqtt config
 
 bitchat_storage_t g_storage;   // extern-able for wifi_bridge.cpp
 static power_config_t   g_power;
@@ -61,6 +64,21 @@ static void print_help(void) {
     Serial.println(F("wifi off        - disconnect"));
     Serial.println(F("wifi set <s> <p>- save creds (SSID spaces OK, pass=last word)"));
     Serial.println(F("wifi stat       - stats only"));
+    Serial.println(F("bat             - battery voltage + ignore status"));
+    Serial.println(F("bat ignore on   - FORCE BLE keep-alive at V_CRIT (NVS persisted)"));
+    Serial.println(F("bat ignore off  - normal V_CRIT behavior (NVS persisted)"));
+    Serial.println(F("bat read        - immediate ADC read"));
+    Serial.println(F("cache           - cache status (RAM + SPIFFS overflow)"));
+    Serial.println(F("cache dump      - list all cached messages"));
+    Serial.println(F("cache clear     - wipe SPIFFS overflow store"));
+    Serial.println(F("cache spiffs    - show SPIFFS cache enable flag"));
+    Serial.println(F("cache spiffs on - enable SPIFFS overflow cache (default, NVS persisted)"));
+    Serial.println(F("cache spiffs off- disable SPIFFS overflow (drop only, no flash writes)"));
+    Serial.println(F("node             - node profile (nickname)"));
+    Serial.println(F("node nick <name>- set node nickname (SPIFFS persisted)"));
+    Serial.println(F("node nick clear  - remove nickname"));
+    Serial.println(F("wifi broker <h> [p] - MQTT broker + port (SPIFFS persisted)"));
+    Serial.println(F("wifi prefix <p>      - MQTT topic prefix (SPIFFS persisted)"));
     Serial.println(F("help            - this help"));
     Serial.println(F("=======================\r\n"));
 }
@@ -172,11 +190,154 @@ static void handle_wifi_command(char* args) {
         }
         wifi_bridge_save_credentials(arg, pass);
     } else if (strcmp(cmd, "broker") == 0 && arg) {
-        extern void wifi_bridge_set_broker(const char* host);
-        // 선언 안 했으므로 inline으로는 안 됨. 직접 구조 변경 필요.
-        LOGW("'wifi broker' not supported yet, edit BC_MQTT_BROKER macro");
+        // wifi broker <host> [port] - MQTT broker 변경 (SPIFFS 영속화)
+        char* host = arg;
+        char* port_str = strchr(arg, ' ');
+        uint16_t port = 1883;
+        if (port_str) {
+            *port_str++ = 0;
+            port = (uint16_t)atoi(port_str);
+            if (port == 0) port = 1883;
+        }
+        if (!wifi_bridge_set_broker(host, port)) {
+            LOGE("wifi: failed to set broker (SPIFFS write error)");
+        }
+    } else if (strcmp(cmd, "prefix") == 0 && arg) {
+        // wifi prefix <prefix> - MQTT topic prefix 변경 (SPIFFS 영속화)
+        if (!wifi_bridge_set_topic_prefix(arg)) {
+            LOGE("wifi: failed to set prefix (SPIFFS write error)");
+        }
     } else {
         LOGE("unknown wifi subcommand: %s", cmd);
+    }
+}
+
+// ============================================================
+// 노드 프로필 Serial 명령 처리
+//
+// 지원 명령:
+//   node                - 현재 프로필 출력 (nickname 등)
+//   node nick <name>    - nickname 설정 (SPIFFS /node.conf에 영속화)
+//   node nick clear     - nickname 제거
+//
+// nickname 용도:
+//   - BLE 광고 이름에 반영 (bitchat-<nick>) - reboot 후 적용
+//   - 상태 출력 시 자기 식별용
+//   - 향후 메시지 헤더에 포함 가능 (TODO)
+// ============================================================
+static void handle_node_command(char* args) {
+    if (!args || *args == 0) {
+        // 현재 프로필 출력
+        const char* nick = node_config_get_nickname();
+        char id[BITCHAT_ID_STR_LEN];
+        bitchat_id_from_pk(g_storage.self_kp.public_key, id);
+        LOGI("=== node profile ===");
+        LOGI("self_id=%s", id);
+        LOGI("nickname=%s", nick[0] ? nick : "(not set)");
+        LOGI("ble_adv_name=%s", nick[0] ? "bitchat-<nick>" : "bitchat");
+        LOGI("(file: /node.conf)");
+        return;
+    }
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "nick") == 0 || strcmp(cmd, "nickname") == 0) {
+        if (!arg || *arg == 0) {
+            LOGE("usage: node nick <name>  or  node nick clear");
+            return;
+        }
+        if (strcmp(arg, "clear") == 0 || strcmp(arg, "off") == 0 ||
+            strcmp(arg, "none") == 0) {
+            if (node_config_set_nickname("")) {
+                LOGI("nickname cleared (SPIFFS /node.conf updated)");
+                LOGW("reboot required to update BLE adv name");
+            } else {
+                LOGE("failed to clear nickname");
+            }
+        } else {
+            if (node_config_set_nickname(arg)) {
+                LOGI("nickname='%s' saved to /node.conf", arg);
+                LOGW("reboot required to update BLE adv name");
+            } else {
+                LOGE("failed to set nickname");
+            }
+        }
+    } else {
+        LOGE("unknown node subcommand: %s (try: nick <name>)", cmd);
+    }
+}
+
+// ============================================================
+// 배터리 Serial 명령 처리
+//
+// 지원 명령:
+//   bat                   - 현재 배터리 전압 + ignore 플래그 상태 출력
+//   bat status            - 위와 동일 (alias)
+//   bat ignore on         - 배터리 임계치 도달해도 BLE 중지하지 않음 (NVS 영속화)
+//   bat ignore off        - 정상 동작으로 복귀 (NVS 영속화)
+//   bat ignore            - 현재 ignore 상태만 출력
+//   bat read              - ADC에서 전압 1회 즉시 읽기
+//
+// 사용 예:
+//   - USB 상시 전원 환경에서 배터리 분배 핀이 있어 CRIT 경고 뜨는 경우
+//     `bat ignore on` → 재부팅 후에도 BLE 유지
+//   - Heltec V2에서 GPIO 13(ADC2)이 WiFi 켜지면 garbage 값 읽어 CRIT 오탐지
+//     `bat ignore on`으로 회피 가능
+// ============================================================
+static void handle_battery_command(char* args) {
+    if (!args || *args == 0 || strcmp(args, "status") == 0) {
+        // 현재 상태 출력
+        float v = power_read_battery_voltage();
+        bool ignored = power_is_battery_ignored();
+        if (v < 0) {
+            LOGI("battery: N/A (ADC disabled or not initialized)");
+        } else {
+            LOGI("battery: %.2fV %s", v, ignored ? "(IGNORED)" : "");
+        }
+        LOGI("battery_ignore: %s (NVS-persisted, survives reboot)",
+             ignored ? "ON" : "OFF");
+        return;
+    }
+
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "ignore") == 0) {
+        if (!arg || *arg == 0) {
+            // bat ignore - 상태만 출력
+            LOGI("battery_ignore: %s",
+                 power_is_battery_ignored() ? "ON" : "OFF");
+            return;
+        }
+        if (strcmp(arg, "on") == 0) {
+            if (storage_set_battery_ignore(true)) {
+                power_reload_battery_ignore();  // power.cpp 캐시 무효화
+                LOGI("battery_ignore=ON (persisted, BLE will keep-alive at V_CRIT)");
+            } else {
+                LOGE("failed to set battery_ignore=ON (NVS error)");
+            }
+        } else if (strcmp(arg, "off") == 0) {
+            if (storage_set_battery_ignore(false)) {
+                power_reload_battery_ignore();
+                LOGI("battery_ignore=OFF (persisted, normal V_CRIT behavior)");
+            } else {
+                LOGE("failed to set battery_ignore=OFF (NVS error)");
+            }
+        } else {
+            LOGE("usage: bat ignore [on|off]");
+        }
+    } else if (strcmp(cmd, "read") == 0) {
+        // 즉시 ADC 읽기
+        float v = power_read_battery_voltage();
+        if (v < 0) {
+            LOGI("battery: ADC not available");
+        } else {
+            LOGI("battery read: %.3fV (raw)", v);
+        }
+    } else {
+        LOGE("unknown battery subcommand: %s (try: status, ignore on|off, read)", cmd);
     }
 }
 
@@ -198,6 +359,46 @@ static void process_serial_input(void) {
                     handle_blacklist_command(args);
                 } else if (strcmp(cmd, "wifi") == 0) {
                     handle_wifi_command(args);
+                } else if (strcmp(cmd, "bat") == 0) {
+                    handle_battery_command(args);
+                } else if (strcmp(cmd, "node") == 0) {
+                    handle_node_command(args);
+                } else if (strcmp(cmd, "cache") == 0) {
+                    if (!args || *args == 0 || strcmp(args, "status") == 0) {
+                        msg_cache_debug_dump();
+                    } else if (strcmp(args, "dump") == 0) {
+                        msg_cache_debug_dump();
+                    } else if (strcmp(args, "clear") == 0) {
+                        if (msg_store_clear()) {
+                            LOGI("msg_store SPIFFS file cleared");
+                        }
+                    } else if (strncmp(args, "spiffs", 6) == 0) {
+                        // 'cache spiffs' / 'cache spiffs on' / 'cache spiffs off'
+                        char* sub = args + 6;
+                        while (*sub == ' ') sub++;  // skip whitespace
+                        if (*sub == 0) {
+                            // 상태만 출력
+                            LOGI("spiffs_cache: %s (NVS-persisted, default=ON)",
+                                 storage_get_spiffs_cache_enabled() ? "ON" : "OFF");
+                        } else if (strcmp(sub, "on") == 0 || strcmp(sub, "enable") == 0) {
+                            if (storage_set_spiffs_cache_enabled(true)) {
+                                LOGI("spiffs_cache=ON (persisted, RAM overflow → SPIFFS)");
+                            } else {
+                                LOGE("failed to set spiffs_cache=ON (NVS error)");
+                            }
+                        } else if (strcmp(sub, "off") == 0 || strcmp(sub, "disable") == 0) {
+                            if (storage_set_spiffs_cache_enabled(false)) {
+                                LOGI("spiffs_cache=OFF (persisted, RAM overflow → drop only)");
+                                LOGI("기존 SPIFFS 데이터는 유지되어 flush 시 전달됨");
+                            } else {
+                                LOGE("failed to set spiffs_cache=OFF (NVS error)");
+                            }
+                        } else {
+                            LOGE("usage: cache spiffs [on|off]");
+                        }
+                    } else {
+                        LOGE("usage: cache [status|dump|clear|spiffs [on|off]]");
+                    }
                 } else if (strcmp(cmd, "help") == 0) {
                     print_help();
                 } else if (strcmp(cmd, "") != 0) {
@@ -259,7 +460,33 @@ void setup() {
     }
     storage_debug_dump(&g_storage);
 
-    // BLE relay 시작
+    // SPIFFS 마운트 - 블랙리스트 영속화 + 향후 파일 저장 용도
+    //   - partitions/no_ota_spiffs_1mb.csv: spiffs 1024KB @ 0x2F0000
+    //   - true = format if mount fails (첫 플래싱 시 자동 포맷)
+    if (!SPIFFS.begin(true)) {
+        LOGE("SPIFFS mount failed, blacklist/node_config/wifi will be degraded");
+    } else {
+        // 사용량 표시 (arduino-esp32 v2.x: totalBytes()/usedBytes())
+        LOGI("SPIFFS mounted: used=%u / total=%u bytes",
+             (unsigned)SPIFFS.usedBytes(),
+             (unsigned)SPIFFS.totalBytes());
+    }
+
+    // 노드 프로필 + WiFi/MQTT 설정 로드 (/node.conf, /wifi.conf)
+    // - SPIFFS 파일 기반, 변경 시에만 write
+    // - NVS(bwifi)에 기존 WiFi 자격증명이 있으면 1회 자동 마이그레이션
+    node_config_init();
+    {
+        const char* nick = node_config_get_nickname();
+        const bc_wifi_config_t* wifi = node_config_get_wifi();
+        LOGI("node profile: nickname='%s'", nick[0] ? nick : "(not set)");
+        LOGI("wifi config: ssid='%s', broker=%s:%u, prefix=%s",
+             wifi->ssid[0] ? wifi->ssid : "(not set)",
+             wifi->mqtt_broker, wifi->mqtt_port,
+             wifi->mqtt_topic_prefix);
+    }
+
+    // BLE relay 시작 (내부에서 blacklist_init() → SPIFFS에서 로드)
     if (!g_relay.begin(&g_storage)) {
         LOGE("BLE relay init failed, halting");
         while (true) { delay(1000); }

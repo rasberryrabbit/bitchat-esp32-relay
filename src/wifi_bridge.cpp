@@ -20,6 +20,7 @@
 #include "ble_relay.h"
 #include "bitchat_protocol.h"
 #include "storage.h"   // 자체 node_id 조회용
+#include "node_config.h"   // SPIFFS-based wifi/mqtt config
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -126,15 +127,24 @@ static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 bool wifi_bridge_init(void) {
     if (g_init_done) return true;
 
+    // SPIFFS에서 wifi/mqtt 설정 로드 (node_config_init 선행)
+    node_config_init();
+    const bc_wifi_config_t* cfg = node_config_get_wifi();
+
+    // 전역 변수 갱신 (RAM 캐시)
+    strncpy(g_mqtt_broker, cfg->mqtt_broker, sizeof(g_mqtt_broker) - 1);
+    g_mqtt_broker[sizeof(g_mqtt_broker) - 1] = 0;
+    g_mqtt_port = cfg->mqtt_port;
+
     // 자체 node_id로 subscribe topic 설정
     // g_storage는 main.cpp에 정의된 bitchat_storage_t 인스턴스
     extern bitchat_storage_t g_storage;
     char node_id[BITCHAT_ID_STR_LEN];
     bitchat_id_from_pk(g_storage.self_kp.public_key, node_id);
     snprintf(g_topic_subscribe, sizeof(g_topic_subscribe),
-             "%s/rx/%s", BC_MQTT_TOPIC_PREFIX, node_id);
+             "%s/rx/%s", cfg->mqtt_topic_prefix, node_id);
     snprintf(g_topic_publish, sizeof(g_topic_publish),
-             "%s/tx", BC_MQTT_TOPIC_PREFIX);
+             "%s/tx", cfg->mqtt_topic_prefix);
 
     // MQTT 콜백 설정
     g_mqtt_client.setServer(g_mqtt_broker, g_mqtt_port);
@@ -143,8 +153,9 @@ bool wifi_bridge_init(void) {
     g_mqtt_client.setKeepAlive(30);   // 30초 keep-alive
 
     g_init_done = true;
-    LOGI("wifi_bridge: ready (broker=%s:%u, topic_prefix=%s)",
-         g_mqtt_broker, g_mqtt_port, BC_MQTT_TOPIC_PREFIX);
+    LOGI("wifi_bridge: ready (broker=%s:%u, topic_prefix=%s, ssid=%s)",
+         g_mqtt_broker, g_mqtt_port, cfg->mqtt_topic_prefix,
+         cfg->ssid[0] ? cfg->ssid : "(not set)");
     LOGI("wifi_bridge: subscribe=%s publish=%s",
          g_topic_subscribe, g_topic_publish);
     return true;
@@ -153,7 +164,7 @@ bool wifi_bridge_init(void) {
 bool wifi_bridge_begin_connection(const char* ssid, const char* password) {
     if (!g_init_done) wifi_bridge_init();
 
-    // SSID/password 결정: 인자 > NVS > 컴파일 타임 매크로
+    // SSID/password 결정: 인자 > SPIFFS(/wifi.conf) > 컴파일 타임 매크로
     char actual_ssid[64] = {0};
     char actual_pass[64] = {0};
 
@@ -161,10 +172,10 @@ bool wifi_bridge_begin_connection(const char* ssid, const char* password) {
         strncpy(actual_ssid, ssid, sizeof(actual_ssid) - 1);
         strncpy(actual_pass, password, sizeof(actual_pass) - 1);
     } else {
-        // NVS에서 조회
+        // SPIFFS에서 조회 (구버전 호환용으로 NVS도 fallback 확인)
         if (!wifi_bridge_load_credentials(actual_ssid, sizeof(actual_ssid),
                                            actual_pass, sizeof(actual_pass))) {
-            // NVS 없으면 컴파일 타임 매크로
+            // SPIFFS/NVS 모두 없으면 컴파일 타임 매크로
 #ifdef BC_WIFI_SSID
             strncpy(actual_ssid, BC_WIFI_SSID, sizeof(actual_ssid) - 1);
             strncpy(actual_pass, BC_WIFI_PASS, sizeof(actual_pass) - 1);
@@ -303,25 +314,76 @@ bool wifi_bridge_publish(const uint8_t* data, size_t len) {
 }
 
 bool wifi_bridge_save_credentials(const char* ssid, const char* password) {
-    nvs_handle_t h;
-    if (nvs_open(BC_WIFI_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    nvs_set_str(h, BC_WIFI_NVS_SSID, ssid);
-    nvs_set_str(h, BC_WIFI_NVS_PASS, password);
-    nvs_commit(h);
-    nvs_close(h);
-    LOGI("wifi: credentials saved to NVS (ssid=%s)", ssid);
-    return true;
+    // SPIFFS(/wifi.conf)에 저장 - node_config 모듈 사용
+    bool ok = node_config_set_wifi_credentials(ssid, password);
+    LOGI("wifi: credentials saved to SPIFFS /wifi.conf (ssid=%s, ok=%d)",
+         ssid ? ssid : "(null)", ok);
+    return ok;
 }
 
 bool wifi_bridge_load_credentials(char* out_ssid, size_t ssid_max,
                                    char* out_pass, size_t pass_max) {
+    if (!out_ssid || !out_pass || ssid_max == 0 || pass_max == 0) return false;
+    out_ssid[0] = 0;
+    out_pass[0] = 0;
+
+    // 1차: SPIFFS /wifi.conf에서 조회
+    const bc_wifi_config_t* cfg = node_config_get_wifi();
+    if (cfg->ssid[0]) {
+        strncpy(out_ssid, cfg->ssid, ssid_max - 1);
+        out_ssid[ssid_max - 1] = 0;
+        strncpy(out_pass, cfg->pass, pass_max - 1);
+        out_pass[pass_max - 1] = 0;
+        return true;
+    }
+
+    // 2차: 구버전 호환 - NVS에서 조회 (1회 마이그레이션 안 된 경우)
     nvs_handle_t h;
     if (nvs_open(BC_WIFI_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     bool ok = true;
     if (nvs_get_str(h, BC_WIFI_NVS_SSID, out_ssid, &ssid_max) != ESP_OK) ok = false;
     if (nvs_get_str(h, BC_WIFI_NVS_PASS, out_pass, &pass_max) != ESP_OK) ok = false;
     nvs_close(h);
+    if (!ok) {
+        out_ssid[0] = 0;
+        out_pass[0] = 0;
+    }
     return ok;
+}
+
+// ----- MQTT broker/port/prefix 설정 (SPIFFS 영속화) -----
+
+bool wifi_bridge_set_broker(const char* broker, uint16_t port) {
+    if (!broker) return false;
+    if (port == 0) port = 1883;  // 기본값
+    bool ok = node_config_set_mqtt_broker(broker, port);
+    LOGI("wifi: mqtt broker → %s:%u (SPIFFS, ok=%d)", broker, port, ok);
+    LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
+    return ok;
+}
+
+bool wifi_bridge_set_topic_prefix(const char* prefix) {
+    if (!prefix) return false;
+    bool ok = node_config_set_mqtt_topic_prefix(prefix);
+    LOGI("wifi: mqtt topic prefix → %s (SPIFFS, ok=%d)", prefix, ok);
+    LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
+    return ok;
+}
+
+const char* wifi_bridge_get_broker(void) {
+    if (!g_init_done) wifi_bridge_init();
+    return g_mqtt_broker;
+}
+
+uint16_t wifi_bridge_get_port(void) {
+    if (!g_init_done) wifi_bridge_init();
+    return g_mqtt_port;
+}
+
+const char* wifi_bridge_get_topic_prefix(void) {
+    if (!g_init_done) wifi_bridge_init();
+    // /wifi.conf의 topic_prefix를 node_config에서 직접 가져옴
+    return node_config_get_wifi()->mqtt_topic_prefix;
 }
 
 void wifi_bridge_debug_dump(void) {
