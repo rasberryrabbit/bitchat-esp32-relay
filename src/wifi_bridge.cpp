@@ -421,7 +421,7 @@ bool wifi_bridge_set_broker(const char* broker, uint16_t port) {
     if (port == 0) port = 1883;  // 기본값
     bool ok = node_config_set_mqtt_broker(broker, port);
     LOGI("wifi: mqtt broker → %s:%u (SPIFFS, ok=%d)", broker, port, ok);
-    LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
+    LOGW("wifi: run 'wifi off' then 'wifi on' to apply changes");
     return ok;
 }
 
@@ -429,7 +429,7 @@ bool wifi_bridge_set_topic_prefix(const char* prefix) {
     if (!prefix) return false;
     bool ok = node_config_set_mqtt_topic_prefix(prefix);
     LOGI("wifi: mqtt topic prefix → %s (SPIFFS, ok=%d)", prefix, ok);
-    LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
+    LOGW("wifi: run 'wifi off' then 'wifi on' to apply changes");
     return ok;
 }
 
@@ -454,7 +454,7 @@ bool wifi_bridge_set_tls_enabled(bool on) {
     bool ok = node_config_set_tls_enabled(on);
     LOGI("wifi: tls → %s (SPIFFS, ok=%d, port=%u)",
          on ? "ON" : "OFF", ok, on ? 8883 : 1883);
-    LOGW("wifi: 변경 적용하려면 'wifi off' 후 'wifi on' 재실행");
+    LOGW("wifi: run 'wifi off' then 'wifi on' to apply changes");
     return ok;
 }
 

@@ -426,13 +426,13 @@ static void handle_sleep_command(char* args) {
         if (strcmp(arg, "on") == 0 || strcmp(arg, "enable") == 0) {
             if (storage_set_deep_sleep_enabled(true)) {
                 LOGI("deep_sleep=ON (persisted, 5min idle → reset + 60s sleep)");
-                LOGW("주의: 딥슬립 wake 시 BLE 연결 끊김 + RAM 상태 손실");
+                LOGW("WARNING: deep sleep wake drops BLE connections + loses RAM state");
             } else {
                 LOGE("failed to set deep_sleep=ON (NVS error)");
             }
         } else if (strcmp(arg, "off") == 0 || strcmp(arg, "disable") == 0) {
             if (storage_set_deep_sleep_enabled(false)) {
-                LOGI("deep_sleep=OFF (persisted, light sleep only - BLE continuity 유지)");
+                LOGI("deep_sleep=OFF (persisted, light sleep only - BLE continuity preserved)");
             } else {
                 LOGE("failed to set deep_sleep=OFF (NVS error)");
             }
@@ -519,11 +519,11 @@ static void handle_dump_command(char* args) {
     }
     if (strcmp(args, "on") == 0 || strcmp(args, "enable") == 0) {
         g_log_dump_enabled = true;
-        LOGI("dump=ON (RX write + hex dump 출력 활성화, RAM-only, 재부팅 시 OFF)");
-        LOGI("주의: 성능 저하 가능. 분석 후 'dump off' 권장");
+        LOGI("dump=ON (RX write + hex dump enabled, RAM-only, resets on reboot)");
+        LOGI("WARNING: may degrade performance. Run 'dump off' after analysis");
     } else if (strcmp(args, "off") == 0 || strcmp(args, "disable") == 0) {
         g_log_dump_enabled = false;
-        LOGI("dump=OFF (기본값, 성능 보호)");
+        LOGI("dump=OFF (default, performance-safe)");
     } else {
         LOGE("usage: dump [on|off]");
     }
@@ -773,7 +773,7 @@ static void process_serial_input(void) {
                         } else if (strcmp(sub, "off") == 0 || strcmp(sub, "disable") == 0) {
                             if (storage_set_spiffs_cache_enabled(false)) {
                                 LOGI("spiffs_cache user=OFF (persisted, effective=OFF)");
-                                LOGI("기존 SPIFFS 데이터는 유지되어 flush 시 전달됨");
+                                LOGI("existing SPIFFS data retained, delivered on flush");
                             } else {
                                 LOGE("failed to set spiffs_cache=OFF (NVS error)");
                             }
