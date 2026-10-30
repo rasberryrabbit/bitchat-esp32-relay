@@ -536,24 +536,42 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     return true;
 }
 
+// v18: 포인터 기반 큐 - malloc으로 버퍼 할당 후 포인터만 큐에 전달
+//   이전: evt.data[744] 배열 복사 (744B × 2회 memcpy)
+//   v18:  malloc(len) + memcpy 1회, 큐에는 포인터(16B)만 전달
+//   xQueueSend timeout 5ms: 큐 가득 시 짧은 대기 → 버스트 흡수 + backpressure
+//   큐 가득 차서 drop 시 malloc된 버퍼 free (memory leak 방지)
 void BitchatRelay::enqueue_packet(const uint8_t* data, size_t len,
                                    BitchatPktSource src, uint16_t conn_id) {
     if (!data || len == 0 || len > BITCHAT_MAX_PKT_LEN) return;
+    uint8_t* buf = (uint8_t*)malloc(len);
+    if (!buf) {
+        LOGW("malloc failed (%uB), dropping packet", (unsigned)len);
+        return;
+    }
+    memcpy(buf, data, len);
     bitchat_pkt_event_t evt;
-    memcpy(evt.data, data, len);
+    evt.data = buf;
     evt.len = len;
     evt.source = src;
     evt.src_conn_id = conn_id;
-    BaseType_t ok = xQueueSend(_pkt_queue, &evt, 0);
+    // timeout 5ms: non-blocking(0) 대신 짧은 대기 → 대형 데이터 버스트 시
+    // 큐가 잠깐 비워지면 enqueue 가능. BLE onWrite 콜백 5ms 블로킹 허용.
+    BaseType_t ok = xQueueSend(_pkt_queue, &evt, pdMS_TO_TICKS(5));
     if (ok != pdPASS) {
+        free(buf);  // 큐 가득 차면 즉시 해제 (leak 방지)
         LOGW("packet queue full, dropping %u bytes", (unsigned)len);
     }
 }
 
+// v18: 큐에서 꺼낸 후 process_packet 처리 → 반드시 free(evt.data)
+//   포인터 기반 큐이므로 malloc된 버퍼를 처리 후 해제해야 leak 방지.
+//   process_packet이 실패하더라도 free는 보장되어야 함.
 void BitchatRelay::loop() {
     bitchat_pkt_event_t evt;
     while (xQueueReceive(_pkt_queue, &evt, 0) == pdPASS) {
         process_packet(&evt);
+        free(evt.data);  // v18: malloc된 버퍼 해제 (leak 방지)
     }
 
     // === v10: 지연된 outgoing 연결 처리 (아두이노 태스크에서 안전하게) ===

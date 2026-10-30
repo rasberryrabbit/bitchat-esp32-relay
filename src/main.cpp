@@ -803,7 +803,7 @@ void setup() {
     delay(100);
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v17 (TX power NVS + minimal logging)");
+    Serial.println(" v18 (pointer-based queue + v17 TX power/dump)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");

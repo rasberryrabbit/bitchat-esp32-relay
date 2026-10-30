@@ -61,11 +61,12 @@
 #define BC_DEDUP_CACHE_SIZE   64
 
 // 패킷 수신 큐 길이 (FreeRTOS queue)
-// 이미지 전송 시 여러 패킷이 연속으로 들어올 수 있으므로 여유 있게 설정
+// v18: 포인터 기반 큐로 전환 → 슬롯당 ~16B (이전 752B)
+// RAM 절약으로 큐 길이 대폭 확장. 대형 데이터(이미지/파일) 버스트 흡수.
 #ifdef BOARD_VARIANT_ESP32C3
-#define BC_PKT_QUEUE_LEN      24   // C3: 12 → 24 (이미지 대응)
+#define BC_PKT_QUEUE_LEN      48   // C3: 포인터 기반 (16B/slot × 48 = 768B)
 #else
-#define BC_PKT_QUEUE_LEN      32   // classic/S3: 16 → 32 (이미지 대응)
+#define BC_PKT_QUEUE_LEN      64   // classic/S3: 포인터 기반 (16B/slot × 64 = 1KB)
 #endif
 
 // 패킷 출처 (어느 링크로 들어왔는지)
@@ -75,8 +76,14 @@ enum BitchatPktSource : uint8_t {
     BC_SRC_LOCAL,           // 자체 생성
 };
 
+// v18: 포인터 기반 큐 이벤트 - data[744] 배열 대신 malloc된 버퍼 포인터
+//   이전: data[BITCHAT_MAX_PKT_LEN] = 744B/slot → 32슬롯 = ~24KB RAM
+//   v18:  uint8_t* data = 4B + len 4B + source 1B + conn_id 2B = ~16B/slot → 64슬롯 = ~1KB RAM
+//   memcpy 2회 (enqueue + xQueueSend struct copy) → 1회 (enqueue만)
+//   처리 후 free(evt.data) 필수 (memory leak 방지)
+//   대형 데이터 전송 시 큐 오버플로우/drop 방지 + RAM 절약
 typedef struct {
-    uint8_t  data[BITCHAT_MAX_PKT_LEN];
+    uint8_t* data;        // malloc된 버퍼 (len 크기)
     size_t   len;
     uint8_t  source;
     uint16_t src_conn_id;
