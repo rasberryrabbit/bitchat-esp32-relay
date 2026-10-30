@@ -135,7 +135,7 @@ public:
         if (val.size() == 0) return;
         const uint8_t* data = val.data();
         size_t len = val.size();
-        LOGD("RX write: %u bytes", (unsigned)len);
+        LOGI("RX write: %u bytes", (unsigned)len);  // v17: 데이터 덤프 표시
 
         if (len > BLE_ACC_BUF_SIZE) {
             _r->enqueue_packet(data, len, BC_SRC_SERVER_RX, 0xFFFF);
@@ -288,7 +288,7 @@ void BitchatRelay::ble_extract_packets() {
             LOGD("BLE acc: skipped %d garbage bytes before packet", skip_count);
             skip_count = 0;
         }
-        LOGD("BLE acc: complete packet %uB extracted", (unsigned)v.total_len);
+        LOGI("BLE acc: complete packet %uB extracted", (unsigned)v.total_len);  // v17: 데이터 덤프 표시
         enqueue_packet(_acc_buf, v.total_len, BC_SRC_SERVER_RX, 0xFFFF);
 
         size_t remaining = _acc_len - v.total_len;

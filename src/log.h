@@ -60,10 +60,12 @@ static inline const char* log_level_str(int lv) {
 #define LOGD(fmt, ...) LOG_BASE(BC_LOG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
 #define LOGT(fmt, ...) LOG_BASE(BC_LOG_LEVEL_TRACE, fmt, ##__VA_ARGS__)
 
-// hex dump - 패킷 분석/디버그용
+// hex dump - 패킷 분석용 (v17: INFO 레벨로 올려 BC_LOG_LEVEL=2에서도 출력)
+//   데이터 덤프는 디버깅 핵심 정보이므로 LOGD가 아닌 INFO로 출력.
+//   나머지 LOGD (scan results, signature verify 등)는 BC_LOG_LEVEL=2에서 제거됨.
 static inline void log_hexdump(const char* tag, const uint8_t* data, size_t len) {
-    if (BC_LOG_LEVEL < BC_LOG_LEVEL_DEBUG) return;
-    LOGD("[%s] len=%u", tag, (unsigned)len);
+    if (BC_LOG_LEVEL < BC_LOG_LEVEL_INFO) return;
+    LOGI("[%s] len=%u", tag, (unsigned)len);
     const size_t per_line = 16;
     char line[160];
     size_t off = 0;
