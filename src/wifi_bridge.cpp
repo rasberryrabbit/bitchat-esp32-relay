@@ -164,6 +164,14 @@ static void udp_process_ack(uint16_t seq);
 static bool udp_rx_seen(uint16_t seq);
 static void udp_rx_mark(uint16_t seq);
 static void udp_retx_check(void);
+// v22: TLS-aware socket helper - g_use_tls에 따라 WiFiClient 또는 WiFiClientSecure 사용
+//   MQTT와 socket은 동시에 사용되지 않으므로 g_wifi_secure를 공유 재사용.
+//   CA cert는 init()에서 g_wifi_secure에 로드됨 (socket에서도 같이 사용).
+static int  sock_write(const uint8_t* buf, size_t len);
+static int  sock_read(uint8_t* buf, size_t len);
+static int  sock_available(void);
+static bool sock_connected(void);
+static void sock_stop(void);
 
 // --- MQTT 콜백 ---
 //   이전: base64-encoded payload → decode → BLE 큐
@@ -489,6 +497,30 @@ static bool mqtt_publish_binary(const uint8_t* data, size_t len) {
     return true;
 }
 
+// v22: TLS-aware socket helper 구현
+//   g_use_tls가 true이면 g_wifi_secure (WiFiClientSecure) 사용, 아니면 g_socket_client (WiFiClient).
+//   MQTT와 socket은 동시 사용 안 하므로 g_wifi_secure 공유. CA cert는 init()에서 로드됨.
+static int sock_write(const uint8_t* buf, size_t len) {
+    if (g_use_tls) return g_wifi_secure.write(buf, len);
+    return g_socket_client.write(buf, len);
+}
+static int sock_read(uint8_t* buf, size_t len) {
+    if (g_use_tls) return g_wifi_secure.read(buf, len);
+    return g_socket_client.read(buf, len);
+}
+static int sock_available(void) {
+    if (g_use_tls) return g_wifi_secure.available();
+    return g_socket_client.available();
+}
+static bool sock_connected(void) {
+    if (g_use_tls) return g_wifi_secure.connected();
+    return g_socket_client.connected();
+}
+static void sock_stop(void) {
+    if (g_use_tls) g_wifi_secure.stop();
+    else g_socket_client.stop();
+}
+
 // v19: socket binary publish (length-prefix 프레이밍: 2B BE length + payload)
 static bool socket_publish(const uint8_t* data, size_t len) {
     if (!g_socket_connected) return false;
@@ -496,45 +528,59 @@ static bool socket_publish(const uint8_t* data, size_t len) {
     uint8_t hdr[2];
     hdr[0] = (uint8_t)((len >> 8) & 0xFF);
     hdr[1] = (uint8_t)(len & 0xFF);
-    if (g_socket_client.write(hdr, 2) != 2) {
+    if (sock_write(hdr, 2) != 2) {
         g_publish_fail++;
         LOGW("socket: write header fail");
         return false;
     }
-    if (g_socket_client.write(data, len) != (int)len) {
+    if (sock_write(data, len) != (int)len) {
         g_publish_fail++;
         LOGW("socket: write payload fail");
         return false;
     }
     g_packets_tx++;
-    LOGD("socket: sent %u bytes to %s:%u, total=%u",
-         (unsigned)len, g_socket_host, g_socket_port, g_packets_tx);
+    LOGD("socket: sent %u bytes to %s:%u (tls=%s), total=%u",
+         (unsigned)len, g_socket_host, g_socket_port,
+         g_use_tls ? "ON" : "OFF", g_packets_tx);
     return true;
 }
 
-// v19: socket 연결 (TCP 클라이언트)
+// v19/v22: socket 연결 (TCP 클라이언트, TLS 지원)
 static bool socket_connect(void) {
     if (g_socket_host[0] == 0) {
         LOGW("socket: no host set (use 'net host <ip> <port>')");
         return false;
     }
-    LOGI("socket: connecting to %s:%u ...", g_socket_host, g_socket_port);
-    if (!g_socket_client.connect(g_socket_host, g_socket_port)) {
-        LOGW("socket: connect failed to %s:%u", g_socket_host, g_socket_port);
-        g_socket_connected = false;
-        return false;
+    if (g_use_tls) {
+        // v22: TLS 모드 - WiFiClientSecure 사용 (CA cert는 init에서 로드됨)
+        // mTLS 시 client cert/key도 init에서 로드됨
+        int port = g_socket_port == 1883 ? 8883 : g_socket_port;  // TLS 기본 포트 8883
+        LOGI("socket: connecting (TLS) to %s:%d ...", g_socket_host, port);
+        if (!g_wifi_secure.connect(g_socket_host, port)) {
+            LOGW("socket: TLS connect failed to %s:%d", g_socket_host, port);
+            g_socket_connected = false;
+            return false;
+        }
+    } else {
+        LOGI("socket: connecting to %s:%u ...", g_socket_host, g_socket_port);
+        if (!g_socket_client.connect(g_socket_host, g_socket_port)) {
+            LOGW("socket: connect failed to %s:%u", g_socket_host, g_socket_port);
+            g_socket_connected = false;
+            return false;
+        }
     }
     g_socket_connected = true;
     g_socket_rx_header = false;
     g_socket_rx_len = 0;
-    LOGI("socket: connected to %s:%u", g_socket_host, g_socket_port);
+    LOGI("socket: connected to %s:%u (tls=%s)", g_socket_host, g_socket_port,
+         g_use_tls ? "ON" : "OFF");
     return true;
 }
 
-// v19: socket 연결 해제
+// v19/v22: socket 연결 해제
 static void socket_disconnect(void) {
     if (g_socket_connected) {
-        g_socket_client.stop();
+        sock_stop();
         g_socket_connected = false;
         LOGI("socket: disconnected");
     }
@@ -558,18 +604,18 @@ static void socket_loop(void) {
         return;
     }
     // 연결 끊김 체크
-    if (!g_socket_client.connected()) {
+    if (!sock_connected()) {
         g_socket_connected = false;
         LOGW("socket: connection lost");
         return;
     }
     // 수신 데이터 처리
-    while (g_socket_client.available()) {
+    while (sock_available()) {
         if (!g_socket_rx_header) {
             // length 헤더 (2바이트) 수신
-            if (g_socket_client.available() < 2) break;
+            if (sock_available() < 2) break;
             uint8_t hdr[2];
-            g_socket_client.read(hdr, 2);
+            sock_read(hdr, 2);
             g_socket_rx_len = ((size_t)hdr[0] << 8) | hdr[1];
             if (g_socket_rx_len == 0 || g_socket_rx_len > BITCHAT_MAX_PKT_LEN) {
                 LOGW("socket: invalid frame length %u, resetting", (unsigned)g_socket_rx_len);
@@ -580,10 +626,10 @@ static void socket_loop(void) {
         }
         if (g_socket_rx_header) {
             // payload 수신
-            size_t avail = g_socket_client.available();
+            size_t avail = sock_available();
             // 전체 payload가 올 때까지 대기 (논블로킹: 다음 루프에서 재시도)
             if (avail < g_socket_rx_len) break;
-            int read = g_socket_client.read(g_socket_rx_buf, g_socket_rx_len);
+            int read = sock_read(g_socket_rx_buf, g_socket_rx_len);
             if (read == (int)g_socket_rx_len) {
                 g_packets_rx++;
                 g_relay.enqueue_packet(g_socket_rx_buf, g_socket_rx_len,

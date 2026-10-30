@@ -65,11 +65,12 @@ static void print_help(void) {
     Serial.println(F("bl rm <hex>      - remove"));
     Serial.println(F("bl clear        - clear all"));
     Serial.println(F("bl stats        - counts only"));
-    Serial.println(F("wifi            - WiFi+MQTT status"));
-    Serial.println(F("wifi on [s p]   - connect (NVS or args; SSID spaces OK)"));
-    Serial.println(F("wifi off        - disconnect"));
-    Serial.println(F("wifi set <s> <p>- save creds (SSID spaces OK, pass=last word)"));
-    Serial.println(F("wifi stat       - stats only"));
+    // v21: wifi 명령은 net으로 통합. 'wifi'는 'net'의 deprecated 별명.
+    Serial.println(F("net             - net status (WiFi + transport)"));
+    Serial.println(F("net on [ssid p] - connect WiFi + transport (SSID spaces OK)"));
+    Serial.println(F("net off         - disconnect"));
+    Serial.println(F("net set <ssid> <pass> - save WiFi creds (SPIFFS)"));
+    Serial.println(F("net stat        - detailed stats"));
     Serial.println(F("bat             - battery voltage + ignore status"));
     Serial.println(F("bat ignore on   - FORCE BLE keep-alive at V_CRIT (NVS persisted)"));
     Serial.println(F("bat ignore off  - normal V_CRIT behavior (NVS persisted)"));
@@ -88,7 +89,6 @@ static void print_help(void) {
     Serial.println(F("dump            - show packet dump status (default OFF)"));
     Serial.println(F("dump on         - enable RX write + hex dump (RAM only, not persisted)"));
     Serial.println(F("dump off        - disable dump (performance-safe)"));
-    Serial.println(F("net             - net transport status (default SOCKET)"));
     Serial.println(F("net mode socket - direct TCP socket (default, no broker)"));
     Serial.println(F("net mode mqtt   - MQTT broker mode (binary, QoS 1)"));
     Serial.println(F("net mode off    - disable internet bridge"));
@@ -96,16 +96,15 @@ static void print_help(void) {
     Serial.println(F("net proto tcp   - TCP length-prefix (default, reliable)"));
     Serial.println(F("net proto udp   - UDP unicast + ACK retransmit (host required)"));
     Serial.println(F("net proto udp-bcast - UDP broadcast + ACK (LAN, no host needed)"));
+    Serial.println(F("net broker <h> [p]   - MQTT broker + port (SPIFFS persisted, MQTT mode)"));
+    Serial.println(F("net prefix <p>       - MQTT topic prefix (SPIFFS persisted)"));
+    Serial.println(F("net tls [on|off]     - mTLS toggle (TCP socket + MQTT, port 8883/1883)"));
     Serial.println(F("peer            - peer_keys mappings (senderID → Ed25519 pk)"));
     Serial.println(F("peer list       - list all peer keys"));
     Serial.println(F("peer clear      - clear all peer keys"));
     Serial.println(F("node             - node profile (nickname)"));
     Serial.println(F("node nick <name>- set node nickname (SPIFFS persisted)"));
     Serial.println(F("node nick clear  - remove nickname"));
-    Serial.println(F("wifi broker <h> [p] - MQTT broker + port (SPIFFS persisted)"));
-    Serial.println(F("wifi prefix <p>      - MQTT topic prefix (SPIFFS persisted)"));
-    Serial.println(F("wifi tls on          - enable mTLS MQTT (port 8883, certs required)"));
-    Serial.println(F("wifi tls off         - disable TLS (plain MQTT port 1883, default)"));
     Serial.println(F("cert status          - show cert files status (CA/client/key)"));
     Serial.println(F("cert upload <ca|client|key> - paste PEM (end with 'EOF' on its own line)"));
     Serial.println(F("cert clear           - delete all cert PEM files"));
@@ -175,90 +174,10 @@ static void handle_blacklist_command(char* args) {
 //   wifi broker <host>    - MQTT broker 호스트 변경 (RAM만, 기본 test.mosquitto.org)
 //
 // ============================================================
-static void handle_wifi_command(char* args) {
-    if (!args || *args == 0) {
-        wifi_bridge_debug_dump();
-        return;
-    }
-    char* cmd = args;
-    char* arg = strchr(args, ' ');
-    if (arg) { *arg++ = 0; }
-
-    if (strcmp(cmd, "on") == 0) {
-        if (wifi_bridge_is_connected()) {
-            LOGW("wifi already connected, use 'wifi off' first");
-            return;
-        }
-        if (arg && *arg) {
-            // wifi on <ssid> <pass> - SSID에 공백 가능 (마지막 공백으로 분할)
-            // 예: wifi on My Home WiFi mypass123
-            //     → ssid="My Home WiFi", pass="mypass123"
-            char* pass = strrchr(arg, ' ');
-            if (pass) { *pass++ = 0; }
-            if (!pass || !*pass) {
-                LOGE("usage: wifi on <ssid> <pass>  (SSID spaces OK, pass=last word)");
-                return;
-            }
-            wifi_bridge_begin_connection(arg, pass);
-        } else {
-            // NVS 또는 컴파일 타임 매크로에서 조회
-            wifi_bridge_begin_connection(nullptr, nullptr);
-        }
-    } else if (strcmp(cmd, "off") == 0) {
-        wifi_bridge_disconnect();
-    } else if (strcmp(cmd, "stat") == 0) {
-        wifi_bridge_debug_dump();
-    } else if (strcmp(cmd, "set") == 0 && arg) {
-        // wifi set <ssid> <pass> - SSID에 공백 가능 (마지막 공백으로 분할)
-        // 예: wifi set My Home WiFi mypass123
-        //     → ssid="My Home WiFi", pass="mypass123" (NVS에 저장)
-        char* pass = strrchr(arg, ' ');
-        if (pass) { *pass++ = 0; }
-        if (!pass || !*pass) {
-            LOGE("usage: wifi set <ssid> <pass>  (SSID spaces OK, pass=last word)");
-            return;
-        }
-        wifi_bridge_save_credentials(arg, pass);
-    } else if (strcmp(cmd, "broker") == 0 && arg) {
-        // wifi broker <host> [port] - MQTT broker 변경 (SPIFFS 영속화)
-        char* host = arg;
-        char* port_str = strchr(arg, ' ');
-        uint16_t port = 1883;
-        if (port_str) {
-            *port_str++ = 0;
-            port = (uint16_t)atoi(port_str);
-            if (port == 0) port = 1883;
-        }
-        if (!wifi_bridge_set_broker(host, port)) {
-            LOGE("wifi: failed to set broker (SPIFFS write error)");
-        }
-    } else if (strcmp(cmd, "prefix") == 0 && arg) {
-        // wifi prefix <prefix> - MQTT topic prefix 변경 (SPIFFS 영속화)
-        if (!wifi_bridge_set_topic_prefix(arg)) {
-            LOGE("wifi: failed to set prefix (SPIFFS write error)");
-        }
-    } else if (strcmp(cmd, "tls") == 0) {
-        // wifi tls [on|off|status]
-        if (!arg || *arg == 0 || strcmp(arg, "status") == 0) {
-            int mask = wifi_bridge_check_certs();
-            LOGI("wifi: tls=%s (port=%u)",
-                 wifi_bridge_get_tls_enabled() ? "ON" : "OFF",
-                 wifi_bridge_get_port());
-            LOGI("  certs: CA=%s, client_cert=%s, client_key=%s (mask=0x%x)",
-                 (mask & 1) ? "OK" : "MISSING",
-                 (mask & 2) ? "OK" : "MISSING",
-                 (mask & 4) ? "OK" : "MISSING", mask);
-        } else if (strcmp(arg, "on") == 0 || strcmp(arg, "enable") == 0) {
-            wifi_bridge_set_tls_enabled(true);
-        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "disable") == 0) {
-            wifi_bridge_set_tls_enabled(false);
-        } else {
-            LOGE("usage: wifi tls [on|off|status]");
-        }
-    } else {
-        LOGE("unknown wifi subcommand: %s", cmd);
-    }
-}
+// v21: wifi 명령은 net으로 통합됨. handle_wifi_command 제거.
+//   이전: wifi on/off/set/broker/prefix/tls/stat
+//   v21:  net on/off/set/broker/prefix/tls/stat (동일 하위 명령)
+//   "wifi" 명령은 "net"의 별명으로 dispatch에서 리다이렉트.
 
 // ============================================================
 // 노드 프로필 Serial 명령 처리
@@ -633,8 +552,77 @@ static void handle_net_command(char* args) {
         } else {
             LOGE("usage: net proto [tcp|udp|udp-bcast]");
         }
+    } else if (strcmp(cmd, "on") == 0) {
+        // net on [ssid pass] - WiFi + 선택된 transport 연결
+        if (wifi_bridge_is_connected()) {
+            LOGW("net: already connected, use 'net off' first");
+            return;
+        }
+        if (arg && *arg) {
+            // net on <ssid> <pass> - SSID에 공백 가능 (마지막 공백으로 분할)
+            char* pass = strrchr(arg, ' ');
+            if (pass) { *pass++ = 0; }
+            if (!pass || !*pass) {
+                LOGE("usage: net on <ssid> <pass>  (SSID spaces OK, pass=last word)");
+                return;
+            }
+            wifi_bridge_begin_connection(arg, pass);
+        } else {
+            wifi_bridge_begin_connection(nullptr, nullptr);
+        }
+    } else if (strcmp(cmd, "off") == 0) {
+        // net off - WiFi + transport 연결 해제
+        wifi_bridge_disconnect();
+    } else if (strcmp(cmd, "stat") == 0 || strcmp(cmd, "status") == 0) {
+        // net stat - 상태 출력 (무인자와 동일)
+        wifi_bridge_debug_dump();
+    } else if (strcmp(cmd, "set") == 0 && arg) {
+        // net set <ssid> <pass> - WiFi 자격증명 저장 (SPIFFS)
+        char* pass = strrchr(arg, ' ');
+        if (pass) { *pass++ = 0; }
+        if (!pass || !*pass) {
+            LOGE("usage: net set <ssid> <pass>  (SSID spaces OK, pass=last word)");
+            return;
+        }
+        wifi_bridge_save_credentials(arg, pass);
+    } else if (strcmp(cmd, "broker") == 0 && arg) {
+        // net broker <host> [port] - MQTT broker 변경 (SPIFFS 영속화)
+        char* host = arg;
+        char* port_str = strchr(arg, ' ');
+        uint16_t port = 1883;
+        if (port_str) {
+            *port_str++ = 0;
+            port = (uint16_t)atoi(port_str);
+            if (port == 0) port = 1883;
+        }
+        if (!wifi_bridge_set_broker(host, port)) {
+            LOGE("net: failed to set broker (SPIFFS write error)");
+        }
+    } else if (strcmp(cmd, "prefix") == 0 && arg) {
+        // net prefix <prefix> - MQTT topic prefix 변경 (SPIFFS 영속화)
+        if (!wifi_bridge_set_topic_prefix(arg)) {
+            LOGE("net: failed to set prefix (SPIFFS write error)");
+        }
+    } else if (strcmp(cmd, "tls") == 0) {
+        // net tls [on|off|status]
+        if (!arg || *arg == 0 || strcmp(arg, "status") == 0) {
+            int mask = wifi_bridge_check_certs();
+            LOGI("net: tls=%s (port=%u)",
+                 wifi_bridge_get_tls_enabled() ? "ON" : "OFF",
+                 wifi_bridge_get_port());
+            LOGI("  certs: CA=%s, client_cert=%s, client_key=%s (mask=0x%x)",
+                 (mask & 1) ? "OK" : "MISSING",
+                 (mask & 2) ? "OK" : "MISSING",
+                 (mask & 4) ? "OK" : "MISSING", mask);
+        } else if (strcmp(arg, "on") == 0 || strcmp(arg, "enable") == 0) {
+            wifi_bridge_set_tls_enabled(true);
+        } else if (strcmp(arg, "off") == 0 || strcmp(arg, "disable") == 0) {
+            wifi_bridge_set_tls_enabled(false);
+        } else {
+            LOGE("usage: net tls [on|off|status]");
+        }
     } else {
-        LOGE("unknown net subcommand: %s (try: mode, host, proto)", cmd);
+        LOGE("unknown net subcommand: %s (try: on, off, stat, set, mode, host, proto, broker, prefix, tls)", cmd);
     }
 }
 
@@ -836,8 +824,12 @@ static void process_serial_input(void) {
 
                 if (strcmp(cmd, "bl") == 0) {
                     handle_blacklist_command(args);
-                } else if (strcmp(cmd, "wifi") == 0) {
-                    handle_wifi_command(args);
+                } else if (strcmp(cmd, "net") == 0 || strcmp(cmd, "wifi") == 0) {
+                    // v21: wifi 명령은 net의 별명 (deprecated, 하위 호환)
+                    if (strcmp(cmd, "wifi") == 0) {
+                        LOGW("wifi: deprecated alias, use 'net' instead");
+                    }
+                    handle_net_command(args);
                 } else if (strcmp(cmd, "bat") == 0) {
                     handle_battery_command(args);
                 } else if (strcmp(cmd, "node") == 0) {
@@ -848,8 +840,6 @@ static void process_serial_input(void) {
                     handle_txpower_command(args);
                 } else if (strcmp(cmd, "dump") == 0) {
                     handle_dump_command(args);
-                } else if (strcmp(cmd, "net") == 0) {
-                    handle_net_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {
@@ -914,7 +904,7 @@ void setup() {
     delay(100);
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v20 (hybrid TCP/UDP/UDP-bcast + MQTT)");
+    Serial.println(" v22 (TLS for TCP socket + MQTT)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
