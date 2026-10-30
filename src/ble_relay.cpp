@@ -63,11 +63,35 @@ public:
         LOGI("client disconnected (%s), in=%d",
              std::string(NimBLEAddress(desc->peer_id_addr)).c_str(),
              _r->_incoming_count);
-        // advertise 재시작 (NimBLE은 자동으로 안 함)
-        // 실패하더라도 loop()의 광고 자가 복구(2초 주기)가 재시도하므로
-        // 폰이 영영 릴레이를 못 찾는 상황은 발생하지 않음
-        if (!server->getAdvertising()->start()) {
-            LOGW("adv restart on disconnect failed, self-heal will retry");
+        // v16: onDisconnect 시마다 새 nonce로 scan response 재설정.
+        //   v15에서 ESP32 재부팅 시 nonce가 바뀌면 폰이 "새 디바이스"로 인식해
+        //   발견/연결 성공했음. 하지만 폰 BLE 토글 후엔 ESP32가 재부팅하지 않으므로
+        //   nonce가 그대로 → 폰이 같은 디바이스로 인식 → 재발견 안 됨.
+        //   onDisconnect에서 새 nonce로 변경하면, 폰이 다음 발견 시 다른 advertising
+        //   데이터를 보고 "새 디바이스"로 인식하여 재발견/재연결 시도.
+        if (_r->_advertising) {
+            uint8_t nonce[4];
+            for (int i = 0; i < 4; i++) nonce[i] = (uint8_t)(esp_random() & 0xFF);
+            NimBLEAdvertisementData scanResp;
+            std::vector<uint8_t> mfg;
+            mfg.push_back(0xFF);  // company ID high (testing)
+            mfg.push_back(0xFF);  // company ID low (testing)
+            mfg.push_back(nonce[0]);
+            mfg.push_back(nonce[1]);
+            mfg.push_back(nonce[2]);
+            mfg.push_back(nonce[3]);
+            scanResp.setManufacturerData(mfg);
+            _r->_advertising->stop();
+            _r->_advertising->setScanResponseData(scanResp);
+            if (!_r->_advertising->start()) {
+                LOGW("adv restart on disconnect failed, self-heal will retry");
+            }
+            LOGI("v16: new nonce on disconnect = %02x%02x%02x%02x",
+                 nonce[0], nonce[1], nonce[2], nonce[3]);
+        } else {
+            if (!server->getAdvertising()->start()) {
+                LOGW("adv restart on disconnect failed, self-heal will retry");
+            }
         }
     }
 private:
@@ -442,9 +466,35 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     //   - 광고 패킷(31B)에 UUID(18B) + "bitchat"(9B) + flags(3B) = 30B ≤ 31B
     //   - 닉네임이 있으면 "bitchat-<nick>"가 되어 31B 초과 → 광고 실패
     //   - 닉네임은 SPIFFS(/node.conf)에 저장, Serial(node)에서만 표시
+    //
+    // v13: setOwnAddrType 호출 안 함 (v11 회귀).
+    //   v12에서 setOwnAddrType(BLE_OWN_ADDR_PUBLIC)를 명시했더니 이 보드의
+    //   efuse BLE MAC(ec:62:60:94:d7:0a)이 폰에서 인식되지 않아 첫 연결조차
+    //   안 됨 → OUI가 할당되지 않은 비정상 MAC으로 판단됨.
+    //   v11 형태(default)로 회귀하면 ble_hs_id_infer_auto()가 efuse MAC이
+    //   invalid일 때 random으로 fallback → 폰 발견 가능 (v11에서 첫 연결 성공).
+    //   단점: random은 매 부팅마다 바뀔 수 있음 → 부팅 후 MAC 로그로 확인.
+    //
+    // v14 진단 결과: 매 부팅마다 MAC=ec:62:60:94:d7:0a로 동일 (random 아님, public 고정).
+    //   그런데도 부팅 1 이후 (폰 BT 토글 / ESP32 재부팅) 에 폰이 재연결 안 함.
+    //   원인: 폰 BLE stack의 GATT/bond cache가 이전 연결 기억 → 새 발견/연결 안 함.
+    //   해결: TX power 상향 + 부팅 후 초고속 advertising + stop/start cycle로
+    //         폰이 "디바이스 사라짐→재등장" 감지해 재발견 유도.
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // v14: TX power +9 dBm (발견 확률 향상, ESP32 max)
     NimBLEDevice::init("bitchat");
     NimBLEDevice::setMTU(247);  // NimBLE 기본 MTU 247 (Bluedroid 517과 다름)
     // NimBLE는 setMTU만으로 client와 server 모두에 적용됨
+
+    // v13: 부팅 후 자기 BLE MAC 로그 출력 (random fallback 여부 확인용).
+    //   매 부팅마다 이 MAC이 동일한지 확인:
+    //   - 동일하면 public 고정 (안정)
+    //   - 매번 바뀌면 random fallback → 재부팅 후 폰 앱이 못 찾는 원인
+    //     (이 경우 v14에서 random static address를 NVS에 저장해 고정 예정)
+    {
+        NimBLEAddress own = NimBLEDevice::getAddress();
+        LOGI("BLE own addr: %s (check: 매 부팅마다 동일한지 확인)",
+             std::string(own).c_str());
+    }
 
     // 1) GATT 서버
     _server = NimBLEDevice::createServer();
@@ -460,24 +510,63 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     _char->setCallbacks(new BitchatRXCallbacks(this));
     _service->start();
 
-    // 2) Advertising - 배터리 모드에서는 저듀티 (1.28s 간격)
+    // 2) Advertising - v11: 발견 우선 (폰 앱이 릴레이를 빠르게 찾도록)
+    //    과거 v10까지 BC_POWER_BATTERY에서 0x800/0x1000 (1.28~2.56s)를 써서
+    //    폰 앱을 껐다 켜는 경우 advertising 패킷을 잡지 못해 onConnect가
+    //    아예 발생하지 않는 문제가 있었음. BLE 발견은 interval ≤ 100ms가
+    //    권장(Apple Accessory Design Guidelines 권장 ≤ 20ms~150ms).
+    //    절전은 연결 후에는 광고가 중단되므로 자연스럽게 달성됨.
     //    Service UUID를 광고에 포함 (bitchat 폰앱이 UUID로 릴레이 노드 발견)
     //    광고 패킷: flags(3) + UUID(18) + "bitchat"(9) = 30 ≤ 31 ✓
     _advertising = NimBLEDevice::getAdvertising();
     _advertising->addServiceUUID(BC_BLE_SERVICE_UUID);
     _advertising->setScanResponse(true);
+    // v15: scan response에 random nonce manufacturer data 추가.
+    //   폰 BLE stack이 advertising 데이터(또는 scan response 데이터) hash로
+    //   디바이스를 식별하는 경우, 매 부팅마다 다른 nonce → 폰이 "새 디바이스"로
+    //   인식하여 GATT/bond cache를 무시하고 새 발견/연결 시도.
+    //   v14 부팅 로그에서 stop/start cycle이 부팅 1에서만 효과 있었고, 재부팅 후엔
+    //   폰이 "이전 디바이스"로 인식해 무시함 → advertising 데이터 자체를 변경.
+    //   company ID 0xFFFF = testing/development (할당 안 됨).
+    {
+        uint8_t nonce[4];
+        for (int i = 0; i < 4; i++) nonce[i] = (uint8_t)(esp_random() & 0xFF);
+        NimBLEAdvertisementData scanResp;
+        std::vector<uint8_t> mfg;
+        mfg.push_back(0xFF);  // company ID high
+        mfg.push_back(0xFF);  // company ID low
+        mfg.push_back(nonce[0]);
+        mfg.push_back(nonce[1]);
+        mfg.push_back(nonce[2]);
+        mfg.push_back(nonce[3]);
+        scanResp.setManufacturerData(mfg);
+        _advertising->setScanResponseData(scanResp);
+        LOGI("v15: scan-response mfg nonce=%02x%02x%02x%02x (매 부팅마다 다름 → 폰이 새 디바이스로 인식)",
+             nonce[0], nonce[1], nonce[2], nonce[3]);
+    }
 #ifdef BC_POWER_BATTERY
-    // setMinPreferred/setMaxPreferred는 0.625ms 단위 (Bluedroid과 동일)
-    // 1.28s = 0x800, 2.048s = 0x1000
-    _advertising->setMinPreferred(0x800);
-    _advertising->setMaxPreferred(0x1000);
-    LOGI("BLE advertising: low-duty 1.28-2.05s (battery mode, NimBLE)");
+    // v14: 발견 최우선 (battery mode라도 연결 전에는 초고속 광고)
+    //   setMinPreferred/setMaxPreferred = advertising interval, 0.625ms 단위
+    //   0x10 = 16  * 0.625ms = 10ms   (초고속, 폰 백그라운드 발견 최적화)
+    //   0x20 = 32  * 0.625ms = 20ms
+    //   v11(20-50ms)보다 더 빠르게. v13 부팅 로그에서 폰이 재연결 안 하는
+    //   증상(GATT cache)에 대한 방어 - 발견 기회 최대화.
+    _advertising->setMinPreferred(0x10);
+    _advertising->setMaxPreferred(0x20);
+    LOGI("BLE advertising: ultra-fast 10-20ms (v14 discovery-max, NimBLE)");
 #else
     _advertising->setMinPreferred(0x06);
     _advertising->setMaxPreferred(0x12);
 #endif
     _advertising->start();
-    LOGI("BLE advertising started as bitchat (NimBLE, UUID=%s)", BC_BLE_SERVICE_UUID);
+    // v11: 부팅 직후 advertising이 실제로 active인지 진단
+    //    NimBLE는 start()가 실패해도 조용히 넘기는 경우가 있어서 isAdvertising()로 확인.
+    //    self-heal이 2초 주기로 다시 살리지만, 부팅 직후 첫 2초 동안 폰 발견이 안 됨.
+    if (_advertising->isAdvertising()) {
+        LOGI("BLE advertising started as bitchat (NimBLE, UUID=%s)", BC_BLE_SERVICE_UUID);
+    } else {
+        LOGE("BLE advertising FAILED to start (NimBLE), self-heal will retry in 2s");
+    }
 
     // 3) Scanner - NimBLE는 ms 단위
     _scan = NimBLEDevice::getScan();
@@ -531,6 +620,62 @@ void BitchatRelay::loop() {
             !_advertising->isAdvertising()) {
             LOGW("advertising inactive with no client, restarting (self-heal)");
             _advertising->start();
+        }
+    }
+
+    // === v12: 부팅 후 10초 동안 2초마다 advertising active 상태 진단 ===
+    //   사용자가 부팅 후 첫 폰 발견 시도 시 advertising가 진짜 송출 중이었는지
+    //   확인. 로그에 "adv=1"이면 정상, "adv=0"이면 BLE 컨트롤러 문제.
+    //   in=N out=N도 함께 출력 → 폰이 연결 시도했는지(onConnect) 추적.
+    static uint32_t boot_diag_until = 0;
+    static uint32_t last_boot_diag = 0;
+    if (boot_diag_until == 0) boot_diag_until = millis() + 10000;
+    if (millis() < boot_diag_until && millis() - last_boot_diag > 2000) {
+        last_boot_diag = millis();
+        LOGI("boot-diag: adv=%d in=%u out=%u acc_len=%u",
+             _advertising ? (int)_advertising->isAdvertising() : -1,
+             (unsigned)_incoming_count, (unsigned)_outgoing_count,
+             (unsigned)_acc_len);
+    }
+
+    // === v14/v15: 부팅 후 advertising stop→start cycle + 주기적 반복 ===
+    //   폰 BLE stack이 이전 연결의 GATT/bond cache를 들고 있어 재발견/재연결을
+    //   안 하는 증상 해결. 부팅 후 3초에서 1회 stop/start (v14), 이후 20초마다
+    //   주기적 stop/start 반복 (v15) → 폰이 주기적으로 "재발견" 기회 가짐.
+    //   클라이언트가 없을 때(_incoming_count==0)만 동작.
+    static uint8_t adv_cycle_step = 0;
+    static uint32_t adv_cycle_t0 = 0;
+    static uint32_t last_periodic_cycle = 0;
+    static bool periodic_stop_phase = false;
+    if (adv_cycle_t0 == 0) adv_cycle_t0 = millis();
+    uint32_t now = millis();
+    if (_incoming_count == 0 && _advertising) {
+        // v14: 부팅 후 1회 stop/start (3초 stop → 4초 restart)
+        if (adv_cycle_step < 2) {
+            uint32_t elapsed = now - adv_cycle_t0;
+            if (adv_cycle_step == 0 && elapsed > 3000) {
+                LOGI("v14: adv stop cycle (re-discovery trigger)");
+                _advertising->stop();
+                adv_cycle_step = 1;
+            } else if (adv_cycle_step == 1 && elapsed > 4000) {
+                _advertising->start();
+                LOGI("v14: adv restart after stop cycle");
+                adv_cycle_step = 2;
+                last_periodic_cycle = now;
+            }
+        } else {
+            // v15: 이후 20초마다 주기적 stop/start 반복
+            if (!periodic_stop_phase && now - last_periodic_cycle > 20000) {
+                LOGI("v15: periodic adv stop (20s cycle, re-discovery trigger)");
+                _advertising->stop();
+                periodic_stop_phase = true;
+                last_periodic_cycle = now;
+            } else if (periodic_stop_phase && now - last_periodic_cycle > 1000) {
+                _advertising->start();
+                LOGI("v15: periodic adv restart");
+                periodic_stop_phase = false;
+                last_periodic_cycle = now;
+            }
         }
     }
 
