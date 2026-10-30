@@ -34,6 +34,12 @@ bitchat_storage_t g_storage;   // extern-able for wifi_bridge.cpp
 static power_config_t   g_power;
 static uint32_t g_last_status_ms = 0;
 
+// v17: 데이터 덤프 런타임 플래그 (RAM only, NVS 저장 안 함, 기본 OFF)
+//   log.h의 LOGDUMP 매크로와 log_hexdump()가 이 플래그 참조.
+//   Serial 명령 'dump on'으로 활성화, 'dump off'로 비활성화.
+//   재부팅 시 항상 OFF (운용 중 임시 디버깅용, 성능 보호).
+bool g_log_dump_enabled = false;
+
 // ============================================================
 // Serial 명령 인터페이스 - 블랙리스트 실시간 관리
 // ============================================================
@@ -79,6 +85,9 @@ static void print_help(void) {
     Serial.println(F("sleep deep off  - disable deep sleep (default, light sleep only)"));
     Serial.println(F("txpower         - show BLE TX power"));
     Serial.println(F("txpower <N>     - set BLE TX power in dBm (-12..9, NVS persisted)"));
+    Serial.println(F("dump            - show packet dump status (default OFF)"));
+    Serial.println(F("dump on         - enable RX write + hex dump (RAM only, not persisted)"));
+    Serial.println(F("dump off        - disable dump (performance-safe)"));
     Serial.println(F("peer            - peer_keys mappings (senderID → Ed25519 pk)"));
     Serial.println(F("peer list       - list all peer keys"));
     Serial.println(F("peer clear      - clear all peer keys"));
@@ -485,6 +494,41 @@ static void handle_txpower_command(char* args) {
     }
 }
 
+// ============================================================
+// 데이터 덤프 Serial 명령 처리 (v17)
+//
+// 지원 명령:
+//   dump              - 현재 덤프 활성화 상태 출력
+//   dump on           - RX write / hex dump 출력 활성화 (RAM only, NVS 저장 안 함)
+//   dump off          - 덤프 비활성화 (기본값, 성능 보호)
+//
+// 성능 영향:
+//   - 166B 패킷 hex dump 시 ~73ms Serial 블로킹 (115200 bps)
+//   - BLE write 버스트(30~90ms 간격)와 겹치면 RX accumulator 지연 → 패킷 손실 가능
+//   - 디버깅 시에만 dump on, 분석 후 반드시 dump off
+//
+// NVS 저장 안 함 이유:
+//   재부팅 후 성능 보호를 위해 항상 OFF로 시작.
+//   운용 중 임시 디버깅용으로만 사용.
+// ============================================================
+static void handle_dump_command(char* args) {
+    if (!args || *args == 0) {
+        LOGI("dump: %s (RAM-only, NVS not persisted, default OFF)",
+             g_log_dump_enabled ? "ON" : "OFF");
+        return;
+    }
+    if (strcmp(args, "on") == 0 || strcmp(args, "enable") == 0) {
+        g_log_dump_enabled = true;
+        LOGI("dump=ON (RX write + hex dump 출력 활성화, RAM-only, 재부팅 시 OFF)");
+        LOGI("주의: 성능 저하 가능. 분석 후 'dump off' 권장");
+    } else if (strcmp(args, "off") == 0 || strcmp(args, "disable") == 0) {
+        g_log_dump_enabled = false;
+        LOGI("dump=OFF (기본값, 성능 보호)");
+    } else {
+        LOGE("usage: dump [on|off]");
+    }
+}
+
 static void handle_peer_command(char* args) {
     if (!args || *args == 0 || strcmp(args, "list") == 0 || strcmp(args, "status") == 0) {
         peer_keys_debug_dump();
@@ -693,6 +737,8 @@ static void process_serial_input(void) {
                     handle_sleep_command(args);
                 } else if (strcmp(cmd, "txpower") == 0) {
                     handle_txpower_command(args);
+                } else if (strcmp(cmd, "dump") == 0) {
+                    handle_dump_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {

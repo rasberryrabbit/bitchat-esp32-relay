@@ -60,10 +60,27 @@ static inline const char* log_level_str(int lv) {
 #define LOGD(fmt, ...) LOG_BASE(BC_LOG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
 #define LOGT(fmt, ...) LOG_BASE(BC_LOG_LEVEL_TRACE, fmt, ##__VA_ARGS__)
 
-// hex dump - 패킷 분석용 (v17: INFO 레벨로 올려 BC_LOG_LEVEL=2에서도 출력)
-//   데이터 덤프는 디버깅 핵심 정보이므로 LOGD가 아닌 INFO로 출력.
-//   나머지 LOGD (scan results, signature verify 등)는 BC_LOG_LEVEL=2에서 제거됨.
+// v17: 데이터 덤프 런타임 활성화 플래그 (RAM only, NVS 저장 안 함)
+//   hex dump와 RX write/extracted 로그는 성능에 영향을 줄 수 있어
+//   기본 OFF. Serial 명령 'dump on'으로만 활성화.
+//   - onWrite 콜백에서 Serial.print는 동기식 블로킹 (115200 bps ~73ms/166B)
+//   - BLE write 버스트(30~90ms 간격)와 겹치면 RX accumulator 지연 → 패킷 손실
+//   - 디버깅 시에만 dump on, 분석 후 dump off
+extern bool g_log_dump_enabled;  // main.cpp에서 정의, 기본 false
+
+// 데이터 덤프 전용 로그 매크로: 플래그가 true일 때만 INFO로 출력
+#define LOGDUMP(fmt, ...)                                                    \
+    do {                                                                     \
+        if (g_log_dump_enabled) {                                            \
+            LOGI(fmt, ##__VA_ARGS__);                                        \
+        }                                                                    \
+    } while (0)
+
+// v17: hex dump - 런타임 플래그 기반 (기본 OFF, 'dump on'으로 활성화)
+//   성능 영향: 166B 패킷 dump 시 ~73ms Serial 블로킹 → BLE write 버스트 지연
+//   NVS에 저장 안 함: 재부팅 시 항상 OFF (의도적, 운용 중 임시 디버깅용)
 static inline void log_hexdump(const char* tag, const uint8_t* data, size_t len) {
+    if (!g_log_dump_enabled) return;
     if (BC_LOG_LEVEL < BC_LOG_LEVEL_INFO) return;
     LOGI("[%s] len=%u", tag, (unsigned)len);
     const size_t per_line = 16;
