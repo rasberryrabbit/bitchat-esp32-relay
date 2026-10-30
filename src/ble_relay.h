@@ -137,6 +137,49 @@ private:
     DedupEntry _dedup[BC_DEDUP_CACHE_SIZE];
     uint32_t   _dedup_idx;
 
+    // =====================================================================
+    // 연결 수명주기 상태 (v10)
+    // =====================================================================
+    // 서버(incoming)로 연결된 피어 주소 목록.
+    // 이미 서버로 연결된 디바이스(폰)에 outgoing 연결을 또 시도하면
+    // 컨트롤러/호스트가 충돌하여 폰 재접속이 계속 실패할 수 있음 → 차단용.
+    NimBLEAddress _srv_peers[BC_MAX_IN_CONN];   // "" (기본값) = 미사용 슬롯
+    int           _srv_peer_idx;                 // 순환 쓰기 인덱스
+
+    // 지연 연결(pending outgoing connect).
+    // onResult는 NimBLE 호스트 태스크에서 호출되므로 그 안에서 블로킹
+    // connect()를 직접 호출하면 안 됨(호스트 태스크가 자기 완료 이벤트를
+    // 기다리는 자기교착 → BLE 전체 4초 블랙아웃 + 방금 맺은 연결 강제
+    // terminate → 앱 재실행 후 덤프가 안 나오는 원인).
+    // → onResult에서는 주소만 기록하고, 실제 연결은 loop()(아두이노
+    //   태스크)에서 안전하게 수행.
+    NimBLEAddress _pending_address;              // 연결 대기 중인 발견 주소
+    bool          _pending_valid;                // 대기 주소 유효 여부
+    bool          _pending_in_flight;            // connect 진행 중 (스캔 일시정지)
+    uint32_t      _pending_seen_ms;              // 발견 시각 (2초 유예용)
+    uint32_t      _pending_last_try_ms;          // 같은 주소 재시도 쿨다운용
+
+    bool is_server_peer(const NimBLEAddress& addr);
+    void add_server_peer(const NimBLEAddress& addr);
+    void remove_server_peer(const NimBLEAddress& addr);
+    void process_pending_connect();              // loop()에서 호출 (태스크 안전)
+
+    // =====================================================================
+    // BLE write accumulator (v9)
+    //   큰 패킷(이미지 등)이 여러 BLE write로 분할되어 오는 것을 누적 조립.
+    //   BitchatRXCallbacks 인스턴스가 아닌 relay 멤버로 승격한 이유:
+    //   서버 콜백(onConnect/onDisconnect)에서 연결 경계마다 리셋할 수 있어야
+    //   하기 때문. 앱을 닫았다 다시 열면(재연결) 이전 세션의 불완전 데이터가
+    //   accumulator에 남아 다음 세션의 메시지를 막았던 것이 v8까지의 버그.
+    // =====================================================================
+    uint8_t  _acc_buf[2 * BITCHAT_MAX_PKT_LEN + 128];   // 2패킷 분량 + 마진 (1744B)
+    volatile size_t   _acc_len;           // 현재 누적 바이트 수
+    volatile uint32_t _acc_last_write_ms; // 마지막 onWrite 시각 (write 간격 감시)
+    volatile uint16_t _acc_wait_total;    // 대기 중 head의 선언 total_len (0=대기 없음)
+    volatile bool     _acc_resync;        // resync 모드 (가짜 헤더 건너뛰기)
+    void ble_acc_reset(const char* reason);  // 연결 경계/비정상 상태에서 버퍼 리셋
+    void ble_extract_packets();              // 누적 버퍼에서 완전한 패킷 추출
+
     void process_packet(bitchat_pkt_event_t* evt);
     bool verify_packet(const uint8_t* data, size_t len,
                        bitchat_packet_view_t* view);

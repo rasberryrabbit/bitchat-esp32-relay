@@ -32,18 +32,43 @@ BitchatRelay g_relay;
 class BitchatServerCallbacks : public NimBLEServerCallbacks {
 public:
     BitchatServerCallbacks(BitchatRelay* r) : _r(r) {}
-    // NimBLE 1.4.2: onConnect/onDisconnect 단일 인자 (ble_gap_conn_desc* 옵션)
-    void onConnect(NimBLEServer* server) override {
+    // === v10 핵심 수정 ===
+    // NimBLE 1.4.2는 onConnect(server)와 onConnect(server, desc)를 "둘 다"
+    // 호출한다. 기존은 단일 인자 버전만 override했기 때문에 피어 주소를
+    // 알 수 없었다. v10은 desc 버전만 override하여 피어 주소를 추적한다
+    // (단일 인자 버전은 기본 no-op 구현이 호출되므로 중복 카운트 없음).
+    void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
+        // 클라이언트(앱)가 새로 연결되면 accumulator를 무조건 리셋.
+        // 앱을 닫았다 다시 열면(재연결) 이전 세션의 이미지 잔여물이
+        // "가짜 헤더"(선언된 total_len보다 데이터가 모자란 상태)로
+        // 버퍼에 남아 있고, 새 세션의 단문이 그 뒤에 쌓여도 영원히
+        // 추출되지 않았음. 연결 경계 = 새 세션 시작 → 버퍼 완전 초기화.
+        _r->ble_acc_reset("connect");
+        _r->add_server_peer(NimBLEAddress(desc->peer_id_addr));
+        // 폰이 서버로 접속했으면 대기 중인 outgoing 연결 시도는 취소
+        // (같은 디바이스에 2중 연결 시도 → 컨트롤러 충돌 방지)
+        _r->_pending_valid = false;
         _r->_incoming_count++;
         _r->_last_connect_ms = millis();   // store-and-forward flush 2초 지연용
-        LOGI("client connected, in=%d out=%d",
+        LOGI("client connected (%s), in=%d out=%d",
+             std::string(NimBLEAddress(desc->peer_id_addr)).c_str(),
              _r->_incoming_count, _r->_outgoing_count);
     }
-    void onDisconnect(NimBLEServer* server) override {
+    void onDisconnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
+        // 연결 종료 = 세션 종료 → 대기 중이던 불완전 패킷은 절대 완성 안 됨.
+        // 리셋하지 않으면 재접속 시 가짜 헤더가 남아 증상이 재현됨.
+        _r->ble_acc_reset("disconnect");
+        _r->remove_server_peer(NimBLEAddress(desc->peer_id_addr));
         if (_r->_incoming_count > 0) _r->_incoming_count--;
-        LOGI("client disconnected, in=%d", _r->_incoming_count);
+        LOGI("client disconnected (%s), in=%d",
+             std::string(NimBLEAddress(desc->peer_id_addr)).c_str(),
+             _r->_incoming_count);
         // advertise 재시작 (NimBLE은 자동으로 안 함)
-        server->getAdvertising()->start();
+        // 실패하더라도 loop()의 광고 자가 복구(2초 주기)가 재시도하므로
+        // 폰이 영영 릴레이를 못 찾는 상황은 발생하지 않음
+        if (!server->getAdvertising()->start()) {
+            LOGW("adv restart on disconnect failed, self-heal will retry");
+        }
     }
 private:
     BitchatRelay* _r;
@@ -53,13 +78,38 @@ private:
 // RX characteristic callbacks (clients write to us)
 // ============================================================================
 // BLE write accumulator: 큰 패킷(이미지 등)이 여러 BLE write로 분할되어
-// 전송되는 것을 누적하여 완전한 패킷으로 조립 후 처리
-// 2개 패킷 분량 확보 (연속으로 오는 패킷 처리용)
+// 전송되는 것을 누적하여 완전한 패킷으로 조립 후 처리.
+// v9: 버퍼/상태를 BitchatRelay 멤버로 승격 → 서버 콜백(onConnect/
+// onDisconnect)에서 연결 경계마다 리셋 가능 (앱 재시작 버그 수정).
+
+// accumulator 버퍼 크기: 2패킷 분량 + 마진 (ble_relay.h의 _acc_buf와 동일)
 #define BLE_ACC_BUF_SIZE  (2 * BITCHAT_MAX_PKT_LEN + 128)  // 2*808 + 128 = 1744B
+
+// 주어진 type 바이트가 bitchat 프로토콜의 유효한 메시지 타입인지 확인
+// → 가비지 바이트가 우연히 0x01(version)과 일치해도 type 필드로
+//   정상 패킷인지 가비지인지 구분 가능
+static bool is_valid_bitchat_type(uint8_t t) {
+    return t == BITCHAT_MSG_ANNOUNCE        // 0x01
+        || t == BITCHAT_MSG_MESSAGE         // 0x02
+        || t == BITCHAT_MSG_LEAVE           // 0x03
+        || t == BITCHAT_MSG_NOISE_HANDSHAKE // 0x10
+        || t == BITCHAT_MSG_NOISE_ENCRYPTED // 0x11
+        || t == BITCHAT_MSG_FRAGMENT        // 0x20
+        || t == BITCHAT_MSG_REQUEST_SYNC    // 0x21
+        || t == BITCHAT_MSG_FILE_TRANSFER   // 0x22
+        || t == BITCHAT_MSG_VOICE_FRAME;    // 0x29
+}
+
+// write 간격 감시 임계값.
+// 정상 bitchat 패킷의 BLE write 분할은 burst(30~90ms 간격)로 도착함.
+// 이전 write와 1.5초 이상 떨어진 onWrite가 도착했는데도 버퍼에
+// 불완전 패킷이 대기 중이라면, 그 head는 전송이 중단된 가짜 헤더
+// (이미지 꼬리의 시그니처 바이트가 우연히 패킷 헤더처럼 보이는 것)임.
+#define BLE_ACC_GAP_TIMEOUT_MS   1500
 
 class BitchatRXCallbacks : public NimBLECharacteristicCallbacks {
 public:
-    BitchatRXCallbacks(BitchatRelay* r) : _r(r), _acc_len(0) {}
+    BitchatRXCallbacks(BitchatRelay* r) : _r(r) {}
 
     void onWrite(NimBLECharacteristic* ch) override {
         NimBLEAttValue val = ch->getValue();
@@ -73,156 +123,182 @@ public:
             return;
         }
 
+        uint32_t now = millis();
+
+        // === v9: write 간격 감시 → resync 모드 ===
+        // 버퍼에 대기 중인 불완전 패킷이 있는 상태로 1.5초 이상 write가
+        // 끊겼다면 그 패킷의 나머지 분할은 오지 않은 것(전송 중단/가짜
+        // 헤더). v8은 이때 버퍼 전체를 버렸지만, 대기 head 뒤에 이미
+        // 쌓여 있던 정상 패킷까지 같이 사라지는 문제가 있었음.
+        // v9는 resync 모드로 전환: extract_packets()가 대기하지 않고
+        // 가짜 헤더를 1바이트씩 건너뛰어 뒤의 정상 패킷을 "구출"함.
+        if (_r->_acc_len > 0 &&
+            (uint32_t)(now - _r->_acc_last_write_ms) > BLE_ACC_GAP_TIMEOUT_MS) {
+            LOGW("BLE acc: write gap %ums with %uB pending -> resync mode",
+                 (unsigned)(now - _r->_acc_last_write_ms),
+                 (unsigned)_r->_acc_len);
+            _r->_acc_resync = true;
+        }
+        _r->_acc_last_write_ms = now;
+
         // 0) 새 데이터 추가 전에 기존 버퍼에서 완전한 패킷 추출 (공간 확보)
         //    이 단계가 없으면 2개 패킷이 버퍼에 쌓였을 때 overflow 발생
-        extract_packets();
+        _r->ble_extract_packets();
 
         // 1) 새 데이터 추가
-        if (_acc_len + len > BLE_ACC_BUF_SIZE) {
+        if (_r->_acc_len + len > BLE_ACC_BUF_SIZE) {
             // 추출 후에도 공간 부족 → 버퍼 리셋 (비정상 상황)
             LOGW("BLE acc: overflow (%u+%u > %u) after extraction, resetting",
-                 (unsigned)_acc_len, (unsigned)len, BLE_ACC_BUF_SIZE);
-            _acc_len = 0;
+                 (unsigned)_r->_acc_len, (unsigned)len, BLE_ACC_BUF_SIZE);
+            _r->_acc_len = 0;
         }
-        memcpy(_acc_buf + _acc_len, data, len);
-        _acc_len += len;
+        memcpy(_r->_acc_buf + _r->_acc_len, data, len);
+        _r->_acc_len += len;
 
         // 2) 새 데이터 추가 후 다시 추출 시도
-        extract_packets();
+        _r->ble_extract_packets();
     }
 
 private:
     BitchatRelay* _r;
-    uint8_t _acc_buf[BLE_ACC_BUF_SIZE];
-    size_t _acc_len;
+};
 
-    // 주어진 type 바이트가 bitchat 프로토콜의 유효한 메시지 타입인지 확인
-    // → 가비지 바이트가 우연히 0x01(version)과 일치해도 type 필드로
-    //   정상 패킷인지 가비지인지 구분 가능
-    static bool is_valid_bitchat_type(uint8_t t) {
-        return t == BITCHAT_MSG_ANNOUNCE        // 0x01
-            || t == BITCHAT_MSG_MESSAGE         // 0x02
-            || t == BITCHAT_MSG_LEAVE           // 0x03
-            || t == BITCHAT_MSG_NOISE_HANDSHAKE // 0x10
-            || t == BITCHAT_MSG_NOISE_ENCRYPTED // 0x11
-            || t == BITCHAT_MSG_FRAGMENT        // 0x20
-            || t == BITCHAT_MSG_REQUEST_SYNC    // 0x21
-            || t == BITCHAT_MSG_FILE_TRANSFER   // 0x22
-            || t == BITCHAT_MSG_VOICE_FRAME;    // 0x29
+// ============================================================================
+// BLE accumulator 구현 (v9) - BitchatRelay 멤버
+// ============================================================================
+
+// 연결 경계(onConnect/onDisconnect) 및 비정상 상태에서 accumulator를 리셋.
+// 연결이 새로 맺어지거나 끊어지면 이전 세션의 불완전 데이터는 절대
+// 완성되지 않으므로 가짜 헤더가 남을 이유가 없음 → 완전 초기화.
+void BitchatRelay::ble_acc_reset(const char* reason) {
+    if (_acc_len > 0) {
+        LOGI("BLE acc: reset on %s (%u bytes pending discarded)",
+             reason, (unsigned)_acc_len);
     }
+    _acc_len = 0;
+    _acc_wait_total = 0;
+    _acc_resync = false;
+    _acc_last_write_ms = 0;
+}
 
-    // 누적 버퍼에서 완전한 패킷 추출 (0개 이상 추출 가능)
-    void extract_packets() {
-        // === Stale head discard (v8) ===
-        // 버퍼의 가장 오래된 바이트(head)의 나이를 추적.
-        // 정상 incomplete 패킷(이미지 청크 등)은 BLE burst로 30~90ms 내 완성됨.
-        // head가 5초 이상 경과했으면 가비지(이미지 시그니처尾部 등)로 판단하여
-        // 버퍼 전체를 폐기 → 다음 패킷이 깨끗한 버퍼에서 시작됨.
-        // (v7의 "버퍼 커짐=가비지" 가정은 정상 incomplete도 버퍼를 키우므로 오류.
-        //  v8은 시간 기반이므로 정상 패킷에 영향 없음.)
-        static uint32_t head_ms = 0;   // 0 = 버퍼 비어있음 또는 head 초기화됨
-        if (_acc_len == 0) {
-            head_ms = 0;
-        } else if (head_ms == 0) {
-            head_ms = millis();        // 빈 버퍼에 데이터가 처음 들어옴
-        } else if (millis() - head_ms > 5000) {
-            LOGW("BLE acc: stale buffer discarded (%u bytes, head age %lums)",
-                 (unsigned)_acc_len,
-                 (unsigned long)(millis() - head_ms));
-            _acc_len = 0;
-            head_ms = 0;
+// 누적 버퍼에서 완전한 패킷 추출 (0개 이상 추출 가능)
+//
+// 가짜 헤더(가비지가 우연히 version=0x01 + 유효 type + 합리적 payload_len
+// 형태를 띤 것) 판정은 3중 방어:
+//   1. 연결 경계 리셋  - onConnect/onDisconnect에서 버퍼 완전 초기화 (결정적)
+//   2. resync 모드     - write 간격 >1.5초인데 대기 중이면 가짜로 판정해
+//                        1바이트씩 건너뛰며 뒤의 정상 패킷 구출 (시간 기반)
+//   3. total_len 초과  - head가 선언한 total_len을 초과했는데도 파싱이
+//                        안 되면 head는 가짜 → 1바이트 스킵 (결정적)
+// 정상 불완전 패킷은 BLE burst 내에 완성되므로 2번의 1.5초 임계값에
+// 걸리지 않음. 3번은 수학적으로 참(진짜 패킷은 자기 total_len을 넘을 수
+// 없음)이므로 오판 없음.
+void BitchatRelay::ble_extract_packets() {
+    int skip_count = 0;  // 연속 스킵 카운터 (가비지 동기화용)
+    while (_acc_len >= BITCHAT_MIN_PKT_LEN) {
+        uint8_t ver = _acc_buf[0];
+        if (ver != BITCHAT_VERSION_1 && ver != BITCHAT_VERSION_2) {
+            _acc_len--;
+            memmove(_acc_buf, _acc_buf + 1, _acc_len);
+            skip_count++;
+            continue;
         }
 
-        int skip_count = 0;  // 연속 스킵 카운터 (가비지 동기화용)
-        while (_acc_len >= BITCHAT_MIN_PKT_LEN) {
-            uint8_t ver = _acc_buf[0];
-            if (ver != BITCHAT_VERSION_1 && ver != BITCHAT_VERSION_2) {
-                _acc_len--;
-                memmove(_acc_buf, _acc_buf + 1, _acc_len);
-                skip_count++;
-                continue;
-            }
+        bitchat_packet_view_t v;
+        if (!bitchat_parse(_acc_buf, _acc_len, &v)) {
+            // 파싱 실패. 두 가지 가능성:
+            //   (A) 정상적인 불완전 패킷 - 더 많은 데이터 필요 → 대기
+            //   (B) 가비지 - byte 0가 우연히 0x01이지만 나머지는 쓰레기 → 스킵
+            uint8_t pkt_type = _acc_buf[1];
+            bool type_valid = is_valid_bitchat_type(pkt_type);
 
-            bitchat_packet_view_t v;
-            if (!bitchat_parse(_acc_buf, _acc_len, &v)) {
-                // 파싱 실패. 두 가지 가능성:
-                //   (A) 정상적인 불완전 패킷 - 더 많은 데이터 필요 → 대기
-                //   (B) 가비지 - byte 0가 우연히 0x01이지만 나머지는 쓰레기 → 스킵
-                //
-                // 구분 휴리스틱: byte 1(type)이 유효한 bitchat 메시지 타입이면
-                // 정상 패킷으로 간주하고 대기. 그렇지 않으면 가비지로 1바이트 스킵.
-                //
-                // 이전 코드는 _acc_len > BITCHAT_MAX_PKT_LEN 일 때만 스킵해서
-                // 이미지 전송 후 남은 가비지가 byte 0=0x01인 경우 break 걸려
-                // 이후 오는 단문 메시지가 버퍼에 누적만 되고 추출되지 않았음.
-                uint8_t pkt_type = _acc_buf[1];
-                bool type_valid = is_valid_bitchat_type(pkt_type);
-
-                if (type_valid && _acc_len <= BITCHAT_MAX_PKT_LEN) {
-                    // 정상적인 불완전 패킷 - 더 많은 데이터 대기
-                    break;
+            // === v9 방어선 3: total_len 초과 판정 ===
+            // 이전에 parse가 성공해서 head의 선언 길이를 기록해 뒀는데
+            // 버퍼가 그 길이를 초과했음에도 아직 파싱 실패라면, head는
+            // 가짜 헤더임이 확실(진짜 패킷은 선언 길이에서 반드시 완성).
+            // 대기 대신 스킵해서 뒤에 쌓인 정상 패킷을 구출.
+            if (_acc_wait_total > 0 && _acc_len > _acc_wait_total) {
+                if (skip_count == 0) {
+                    LOGW("BLE acc: fake header detected "
+                         "(declared %uB, buffer %uB) -> resync",
+                         (unsigned)_acc_wait_total, (unsigned)_acc_len);
                 }
-                // 가비지이거나 버퍼가 너무 큼 → 1바이트 스킵 (resync)
+                _acc_wait_total = 0;
                 _acc_len--;
                 memmove(_acc_buf, _acc_buf + 1, _acc_len);
                 skip_count++;
                 continue;
             }
 
-            // total_len이 비정상적으로 크면 가비지 → 1바이트 스킵
-            if (v.total_len > BITCHAT_MAX_PKT_LEN) {
-                _acc_len--;
-                memmove(_acc_buf, _acc_buf + 1, _acc_len);
-                skip_count++;
-                continue;
-            }
-
-            if (v.total_len > _acc_len) {
-                // 파싱은 성공했으나 아직 전체 패킷이 도착하지 않음 → 대기
-                // (version + type + 모든 필드가 유효하므로 정상 패킷)
+            if (type_valid && _acc_len <= BITCHAT_MAX_PKT_LEN && !_acc_resync) {
+                // 정상적인 불완전 패킷 - 더 많은 데이터 대기
                 break;
             }
-
-            // 완전한 패킷!
-            if (skip_count > 0) {
-                LOGD("BLE acc: skipped %d garbage bytes before packet", skip_count);
-                skip_count = 0;
-            }
-            LOGD("BLE acc: complete packet %uB extracted", (unsigned)v.total_len);
-            _r->enqueue_packet(_acc_buf, v.total_len, BC_SRC_SERVER_RX, 0xFFFF);
-
-            size_t remaining = _acc_len - v.total_len;
-            if (remaining > 0) {
-                memmove(_acc_buf, _acc_buf + v.total_len, remaining);
-                // head가 이동함. remaining은 최근 데이터이므로 head_ms 갱신
-                // (보수적: age를 과소평가 → stale 판정이 늦어질 뿐, 안전)
-                head_ms = millis();
-            }
-            _acc_len = remaining;
-            // 정상 패킷은 최소 MIN_PKT_LEN(22B)이므로, 추출 후 남은 잔여물이
-            // 22바이트 미만이면 무조건 가비지로 판단하여 버림.
-            // → 다음 단문 패킷이 버퍼 맨 앞에서 깨끗하게 시작됨
-            if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
-                LOGD("BLE acc: discarded %d small leftover bytes", (int)_acc_len);
-                _acc_len = 0;
-                head_ms = 0;
-            }
+            // resync 모드면 대기하지 않고 가짜 헤더를 건너뜀
+            _acc_len--;
+            memmove(_acc_buf, _acc_buf + 1, _acc_len);
+            skip_count++;
+            continue;
         }
+
+        // total_len이 비정상적으로 크면 가비지 → 1바이트 스킵
+        if (v.total_len > BITCHAT_MAX_PKT_LEN) {
+            _acc_len--;
+            memmove(_acc_buf, _acc_buf + 1, _acc_len);
+            skip_count++;
+            continue;
+        }
+
+        if (v.total_len > _acc_len) {
+            // 파싱은 성공했으나 아직 전체 패킷이 도착하지 않음.
+            // 정상이면 대기하지만, resync 모드(write 간격 초과)에서는
+            // 전송이 이미 중단된 가짜 헤더로 간주하고 건너뜀.
+            if (!_acc_resync) {
+                _acc_wait_total = v.total_len;   // 기대 길이 기록 (방어선 3용)
+                break;
+            }
+            _acc_len--;
+            memmove(_acc_buf, _acc_buf + 1, _acc_len);
+            skip_count++;
+            continue;
+        }
+
+        // 완전한 패킷!
+        _acc_wait_total = 0;
         if (skip_count > 0) {
-            LOGD("BLE acc: skipped %d garbage bytes (no complete packet found)", skip_count);
+            LOGD("BLE acc: skipped %d garbage bytes before packet", skip_count);
+            skip_count = 0;
         }
-        // while 루프 종료 후 (break로 빠져나온 경우) 남은 잔여물 처리
-        // 패킷 추출 후의 discard는 위에서 처리하지만, break로 종료 시에는
-        // 여기서 처리해야 함. while 루프가 break로 종료되면 버퍼에
-        // 가비지가 남아 다음 단문 패킷 추출을 막음.
-        // 정상 패킷은 최소 22바이트이므로 22바이트 미만 잔여물은 가비지.
+        LOGD("BLE acc: complete packet %uB extracted", (unsigned)v.total_len);
+        enqueue_packet(_acc_buf, v.total_len, BC_SRC_SERVER_RX, 0xFFFF);
+
+        size_t remaining = _acc_len - v.total_len;
+        if (remaining > 0) {
+            memmove(_acc_buf, _acc_buf + v.total_len, remaining);
+        }
+        _acc_len = remaining;
+        // 정상 패킷은 최소 MIN_PKT_LEN(22B)이므로, 추출 후 남은 잔여물이
+        // 22바이트 미만이면 무조건 가비지로 판단하여 버림.
+        // → 다음 단문 패킷이 버퍼 맨 앞에서 깨끗하게 시작됨
         if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
-            LOGD("BLE acc: discarded %d small leftover bytes (post-loop)", (int)_acc_len);
+            LOGD("BLE acc: discarded %d small leftover bytes", (int)_acc_len);
             _acc_len = 0;
-            head_ms = 0;
         }
     }
-};
+    if (skip_count > 0) {
+        LOGD("BLE acc: skipped %d garbage bytes (no complete packet found)", skip_count);
+    }
+    // while 루프 종료 후 (break로 빠져나온 경우) 남은 잔여물 처리
+    // 정상 패킷은 최소 22바이트이므로 22바이트 미만 잔여물은 가비지.
+    if (_acc_len > 0 && _acc_len < BITCHAT_MIN_PKT_LEN) {
+        LOGD("BLE acc: discarded %d small leftover bytes (post-loop)", (int)_acc_len);
+        _acc_len = 0;
+    }
+    // resync 모드는 추출 시도 1회 동안만 유지.
+    // 이번에 끝까지 스킵했는데도 여전히 "대기" 상태로 끝났다면 그 head는
+    // 다음 write가 오면 정상 대기 로직으로 판정함(1.5초 간격 감시가 재판정).
+    _acc_resync = false;
+}
 
 // ============================================================================
 // Advertised device callbacks (scanner discovers bitchat peers)
@@ -261,15 +337,32 @@ public:
             }
         }
         if (!already_known) {
-            for (int i = 0; i < BC_MAX_OUT_CONN; ++i) {
-                if (!_r->_peers[i].connected) {
-                    memcpy(_r->_peers[i].addr, raw_addr, 6);
-                    _r->_peers[i].addr_valid = true;
-                    _r->_peers[i].last_seen_ms = millis();
-                    _r->connect_to_peer(addr);
-                    break;
-                }
+            // 이미 서버(수신 링크)로 연결된 디바이스면 outgoing 연결 시도 금지.
+            // 폰 앱 재실행 시 폰이 우리 서버로 접속하는데, 스캔이 폰 광고를
+            // 발견해서 outgoing 연결을 또 시도하면 컨트롤러 충돌로
+            // 재접속이 반복 실패할 수 있음.
+            if (_r->is_server_peer(addr)) {
+                return;
             }
+            // === v10 핵심 수정 ===
+            // onResult는 NimBLE 호스트 태스크(ble host task)에서 호출된다.
+            // 여기서 블로킹 connect()를 직접 호출하면:
+            //   1) connect 완료 이벤트를 처리할 주체가 지금 이 태스크 자신인데
+            //      콜백 안에서 세마포어를 기다리므로 타임아웃(3+1초)까지
+            //      BLE 전체(서버 수신 포함)가 멈춤 = 4초 블랙아웃
+            //   2) 대기 중에 LL 연결이 맺어지면 타임아웃 후 NimBLE이
+            //      m_pTaskData==nullptr를 보고 방금 맺은 연결을 강제 종료
+            //      (NimBLEClient.cpp의 BLE_GAP_EVENT_CONNECT 참고)
+            //      → 폰 재접속이 반복 실패 → 앱 재실행 후 덤프가 안 나옴
+            // → 여기서는 주소만 기록하고 실제 연결은 loop() 태스크에서 수행
+            if (!_r->_pending_valid && !_r->_pending_in_flight) {
+                _r->_pending_address = addr;
+                _r->_pending_valid = true;
+                _r->_pending_seen_ms = millis();
+                LOGD("outgoing connect queued: %s",
+                     std::string(addr).c_str());
+            }
+            (void)raw_addr;
         }
     }
 private:
@@ -312,9 +405,18 @@ BitchatRelay::BitchatRelay()
       _scan(nullptr), _pkt_queue(nullptr), _scan_active(false),
       _incoming_count(0), _outgoing_count(0),
       _last_connect_ms(0),
+      _srv_peer_idx(0),
+      _pending_valid(false), _pending_in_flight(false),
+      _pending_seen_ms(0), _pending_last_try_ms(0),
       _peer_slot_count(0), _dedup_idx(0) {
     memset(_peers, 0, sizeof(_peers));
     memset(_dedup, 0, sizeof(_dedup));
+    // v9: BLE accumulator 초기화
+    memset(_acc_buf, 0, sizeof(_acc_buf));
+    _acc_len = 0;
+    _acc_last_write_ms = 0;
+    _acc_wait_total = 0;
+    _acc_resync = false;
 }
 
 BitchatRelay::~BitchatRelay() {
@@ -413,6 +515,23 @@ void BitchatRelay::loop() {
     bitchat_pkt_event_t evt;
     while (xQueueReceive(_pkt_queue, &evt, 0) == pdPASS) {
         process_packet(&evt);
+    }
+
+    // === v10: 지연된 outgoing 연결 처리 (아두이노 태스크에서 안전하게) ===
+    process_pending_connect();
+
+    // === v10: 광고 자가 복구 ===
+    // onDisconnect에서 광고 재시작이 실패했거나 다른 이유로 광고가 꺼져
+    // 있으면 폰이 릴레이를 영영 찾지 못함(앱 재실행 후 덤프 없음) →
+    // 2초마다 점검하여 클라이언트가 없는데 광고가 꺼져 있으면 재시작
+    static uint32_t last_adv_check = 0;
+    if (millis() - last_adv_check > 2000) {
+        last_adv_check = millis();
+        if (_incoming_count == 0 && _advertising &&
+            !_advertising->isAdvertising()) {
+            LOGW("advertising inactive with no client, restarting (self-heal)");
+            _advertising->start();
+        }
     }
 
     static uint32_t last_retry_check = 0;
@@ -755,7 +874,8 @@ void BitchatRelay::scan_cycle() {
         return;
     }
 
-    if (!_scan_active && (now - cycle_start > CYCLE_GAP - SCAN_DURATION)) {
+    if (!_scan_active && !_pending_in_flight &&
+        (now - cycle_start > CYCLE_GAP - SCAN_DURATION)) {
         _scan_active = true;
         scan_start = now;
         // NimBLE Scan::start(duration, callback, is_continue)
@@ -841,6 +961,83 @@ bool BitchatRelay::connect_to_peer(NimBLEAddress addr) {
     LOGI("connected to peer %s (out=%d, NimBLE)",
          std::string(addr).c_str(), _outgoing_count);
     return true;
+}
+
+// ============================================================================
+// 서버(incoming) 피어 주소 추적 (v10)
+// ============================================================================
+// 서버로 연결된 피어 주소를 기록/삭제/조회한다.
+// 용도: 스캔이 발견한 주소가 이미 서버 링크로 연결된 디바이스(폰)면
+// outgoing 연결을 시도하지 않도록 차단.
+bool BitchatRelay::is_server_peer(const NimBLEAddress& addr) {
+    for (int i = 0; i < BC_MAX_IN_CONN; ++i) {
+        if (_srv_peers[i] == addr) return true;
+    }
+    return false;
+}
+
+void BitchatRelay::add_server_peer(const NimBLEAddress& addr) {
+    // 이미 기록돼 있으면 스킵
+    for (int i = 0; i < BC_MAX_IN_CONN; ++i) {
+        if (_srv_peers[i] == addr) return;
+    }
+    // 빈 슬롯 우선 사용
+    for (int i = 0; i < BC_MAX_IN_CONN; ++i) {
+        if (_srv_peers[i] == NimBLEAddress()) {
+            _srv_peers[i] = addr;
+            return;
+        }
+    }
+    // 모든 슬롯 사용 중 → 순환 인덱스로 가장 오래된 슬롯 교체
+    _srv_peers[_srv_peer_idx % BC_MAX_IN_CONN] = addr;
+    _srv_peer_idx = (_srv_peer_idx + 1) % BC_MAX_IN_CONN;
+}
+
+void BitchatRelay::remove_server_peer(const NimBLEAddress& addr) {
+    for (int i = 0; i < BC_MAX_IN_CONN; ++i) {
+        if (_srv_peers[i] == addr) {
+            _srv_peers[i] = NimBLEAddress();
+            return;
+        }
+    }
+}
+
+// ============================================================================
+// 지연 연결 처리 (v10) - 반드시 loop()(아두이노 태스크)에서만 호출
+// ============================================================================
+// onResult(호스트 태스크)에서 connect()를 직접 호출하면 호스트 태스크가
+// 자기 완료 이벤트를 기다리는 자기교착(4초 블랙아웃 + 강제 terminate)이
+// 발생하므로, 발견한 주소를 여기서 안전하게 연결한다.
+void BitchatRelay::process_pending_connect() {
+    if (!_pending_valid || _pending_in_flight) return;
+    if (_incoming_count > 0) {
+        // 폰이 서버로 접속했다면 outgoing 연결 불필요
+        // (단일 링크로 write/notify 모두 처리 가능)
+        _pending_valid = false;
+        return;
+    }
+    uint32_t now = millis();
+    // 발견 후 2초 유예: 폰이 먼저 우리 서버로 접속할 시간을 줌
+    if (now - _pending_seen_ms < 2000) return;
+    // 같은 주소 재시도 쿨다운 10초 (무한 재시도 스팸 방지)
+    if (_pending_last_try_ms != 0 &&
+        now - _pending_last_try_ms < 10000) return;
+
+    // 스캔 중이면 중지 후 시도 (BLE 컨트롤러 충돌 방지)
+    if (_scan_active) {
+        _scan->stop();
+        _scan_active = false;
+    }
+
+    _pending_in_flight = true;
+    _pending_last_try_ms = now;
+    LOGI("deferred connect attempt: %s",
+         std::string(_pending_address).c_str());
+    connect_to_peer(_pending_address);
+    _pending_in_flight = false;
+    // 성공/실패 무관 소비. 실패해도 폰 광고가 계속 보이면 onResult가
+    // 다시 큐잉하며, 쿨다운(10초)이 재시도 간격을 보장함.
+    _pending_valid = false;
 }
 
 void BitchatRelay::disconnect_peer(PeerEntry* p) {
