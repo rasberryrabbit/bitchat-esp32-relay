@@ -323,3 +323,55 @@ bool storage_set_deep_sleep_enabled(bool enabled) {
          enabled ? "ON" : "OFF");
     return true;
 }
+
+// ----- BLE TX power (NVS 영속화) -----
+
+static int8_t clamp_tx_power(int8_t dbm) {
+    // ESP32 family 공통 안전 범위: -12 ~ +12 dBm
+    // ESP32 classic은 +9가 최대이지만 NimBLE가 내부적으로 클램프하므로
+    // 상한 +12로 두고 하한 -12로 설정.
+    if (dbm < -12) dbm = -12;
+    if (dbm > 12)  dbm = 12;
+    return dbm;
+}
+
+int8_t storage_get_tx_power(void) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 9;  // NVS 열기 실패 시 기본값 +9 dBm
+    }
+    int8_t val = 9;  // 기본값
+    // int8_t를 uint8_t로 저장했으므로 uint8_t로 읽어서 캐스팅
+    uint8_t raw = 9;
+    esp_err_t err = nvs_get_u8(h, BC_NVS_KEY_TXPWR, &raw);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        return 9;  // 키 없으면 기본값
+    }
+    val = (int8_t)raw;
+    return clamp_tx_power(val);
+}
+
+bool storage_set_tx_power(int8_t dbm) {
+    dbm = clamp_tx_power(dbm);
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        LOGE("storage: NVS open failed for tx_power");
+        return false;
+    }
+    uint8_t val = (uint8_t)dbm;
+    esp_err_t err = nvs_set_u8(h, BC_NVS_KEY_TXPWR, val);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        LOGE("storage: NVS set tx_power failed: 0x0000", err);
+        return false;
+    }
+    // ble_relay에 즉시 적용 (헤더 순환 의존 피하기 위해 extern 함수 사용)
+    extern void ble_apply_tx_power(int8_t dbm);
+    ble_apply_tx_power(dbm);
+    LOGI("tx_power=%+ddBm (persisted)", (int)dbm);
+    return true;
+}

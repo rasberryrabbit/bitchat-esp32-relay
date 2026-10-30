@@ -31,6 +31,7 @@ extern "C" {
 #define BC_NVS_KEY_BAT_IGN "bat_ign"  // 배터리 상태 무시 플래그 (uint8_t, 0/1)
 #define BC_NVS_KEY_SFF_EN  "sff_en"   // store-and-forward SPIFFS 캐시 enable (uint8_t, 0/1, 기본 1=ON)
 #define BC_NVS_KEY_DS_EN   "dpslp"    // 딥슬립 허용 플래그 (uint8_t, 0/1, 기본 0=OFF)
+#define BC_NVS_KEY_TXPWR   "txpwr"    // BLE TX power (int8_t dBm, 기본 9=+9dBm)
 #define BC_MAX_PEERS       32  // 최대 캐시 피어 수
 
 typedef struct {
@@ -159,6 +160,26 @@ bool storage_get_spiffs_cache_effective(void);
 
 bool storage_get_deep_sleep_enabled(void);  // 기본 false (OFF)
 bool storage_set_deep_sleep_enabled(bool enabled);
+
+// ----- BLE TX power 설정 (NVS 영속화) -----
+//
+//   NimBLE 출력 전력을 dBm 단위로 설정. ESP32 classic은 -12~+9 dBm,
+//   ESP32-C3/S3는 -12~+12 dBm 지원. 허용 범위 밖 값은 클램프.
+//   기본값: +9 dBm (발견 확률 최우선, 연결 후엔 advertising 안 나가므로
+//   실제 송출 시간 = 미연결 유휴 시간뿐이라 전력 소모 한계적).
+//
+//   적용 시점:
+//     - ble_relay.cpp begin(): NVS에서 로드하여 NimBLEDevice::setPower() 호출
+//     - main.cpp 'txpower <N>' Serial 명령으로 런타임 변경 + NVS 저장
+//     - 변경 즉시 NimBLEDevice::setPower() 재적용 (advertising 재시작 불필요)
+//
+//   사용 사례:
+//     - 멀리 있는 폰 발견: txpower 9 (최대, 기본값)
+//     - 배터리 절약 + 근거리: txpower 0 또는 3
+//     - 극단적 절전: txpower -3
+
+int8_t storage_get_tx_power(void);              // 기본 +9 dBm
+bool storage_set_tx_power(int8_t dbm);          // NVS에 저장 + ble_relay에 즉시 적용
 
 #ifdef __cplusplus
 }

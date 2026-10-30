@@ -77,6 +77,8 @@ static void print_help(void) {
     Serial.println(F("sleep           - power management status"));
     Serial.println(F("sleep deep on   - enable deep sleep after 5min idle (NVS persisted)"));
     Serial.println(F("sleep deep off  - disable deep sleep (default, light sleep only)"));
+    Serial.println(F("txpower         - show BLE TX power"));
+    Serial.println(F("txpower <N>     - set BLE TX power in dBm (-12..9, NVS persisted)"));
     Serial.println(F("peer            - peer_keys mappings (senderID → Ed25519 pk)"));
     Serial.println(F("peer list       - list all peer keys"));
     Serial.println(F("peer clear      - clear all peer keys"));
@@ -444,6 +446,45 @@ static void handle_sleep_command(char* args) {
 //
 // 매핑 추가는 자동: BLE ANNOUNCE 메시지 수신 시 ble_relay.cpp에서 peer_keys_add() 호출
 // ============================================================
+
+// ============================================================
+// BLE TX power Serial 명령 처리
+//
+// 지원 명령:
+//   txpower           - 현재 TX power 출력
+//   txpower <N>       - TX power를 N dBm으로 설정 (NVS 영속화, 즉시 적용)
+//                       허용 범위: -12 ~ +9 (ESP32 classic 최대 +9)
+//
+// 사용 예:
+//   txpower 9         - 최대 출력 (기본값, 발견 확률 최우선)
+//   txpower 0         - 0 dBm (근거리 + 절전)
+//   txpower -3        - -3 dBm (극단적 절전)
+// ============================================================
+static void handle_txpower_command(char* args) {
+    if (!args || *args == 0) {
+        int8_t cur = storage_get_tx_power();
+        LOGI("txpower: %+ddBm (NVS-persisted, range -12..9)", (int)cur);
+        return;
+    }
+    // strtol로 파싱 (음수 허용)
+    char* endp = nullptr;
+    long val = strtol(args, &endp, 10);
+    if (endp == args || *endp != 0) {
+        LOGE("usage: txpower <dBm>  (e.g. txpower 9, txpower 0, txpower -3)");
+        return;
+    }
+    if (val < -12 || val > 9) {
+        LOGE("txpower out of range: %ld (allowed -12..9)", val);
+        return;
+    }
+    if (storage_set_tx_power((int8_t)val)) {
+        // storage_set_tx_power이 ble_apply_tx_power()를 호출하여 즉시 적용
+        LOGI("txpower set to %+ddBm (applied + persisted)", (int)val);
+    } else {
+        LOGE("failed to set txpower (NVS error)");
+    }
+}
+
 static void handle_peer_command(char* args) {
     if (!args || *args == 0 || strcmp(args, "list") == 0 || strcmp(args, "status") == 0) {
         peer_keys_debug_dump();
@@ -650,6 +691,8 @@ static void process_serial_input(void) {
                     handle_node_command(args);
                 } else if (strcmp(cmd, "sleep") == 0) {
                     handle_sleep_command(args);
+                } else if (strcmp(cmd, "txpower") == 0) {
+                    handle_txpower_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {
@@ -714,7 +757,7 @@ void setup() {
     delay(100);
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v16 (new nonce on disconnect for re-discovery)");
+    Serial.println(" v17 (TX power NVS + minimal logging)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
@@ -830,8 +873,8 @@ void loop() {
     // 전원 관리 - 유휴 시 라이트 슬립 + 상태 LED + 배터리 모니터링
     power_handle_idle();
 
-    // 5초마다 상태 요약
-    if (millis() - g_last_status_ms > 5000) {
+    // 30초마다 상태 요약 (v17: 5초 → 30초로 로그 최소화)
+    if (millis() - g_last_status_ms > 30000) {
         g_last_status_ms = millis();
         LOGI("--- status: in=%d out=%d ctr=%llu peers=%u ---",
              g_relay.incoming_count(),
