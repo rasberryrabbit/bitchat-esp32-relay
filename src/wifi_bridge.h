@@ -21,6 +21,12 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+// v19: bc_net_mode_t 정의를 위해 node_config.h include
+//   (C 호환 헤더이므로 enum만 사용, C++ 클래스는 미사용)
+#ifdef __cplusplus
+#include "node_config.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -100,6 +106,35 @@ const char* wifi_bridge_get_topic_prefix(void);
 // 인증서 파일 존재 여부 확인 (node_config_check_certs 위임)
 // 반환: bitmask (1=CA, 2=client_cert, 4=client_key)
 int wifi_bridge_check_certs(void);
+
+// ----- v19: transport mode (socket 직접 통신 vs MQTT) -----
+//   bc_net_mode_t는 node_config.h에 정의됨 (중복 방지)
+//   기본: SOCKET (MQTT 브로커 의존 없이 직접 TCP 연결)
+//   MQTT: 기존 MQTT 브로커 방식 (binary payload)
+//   OFF:  인터넷 전송 비활성화
+//   Serial 'net mode socket|mqtt|off'로 변경 (SPIFFS /wifi.conf에 영속화)
+
+// v19: transport mode 설정/조회 (NVS 영속화, 기본 SOCKET)
+bool wifi_bridge_set_mode(bc_net_mode_t mode);
+bc_net_mode_t wifi_bridge_get_mode(void);
+const char* wifi_bridge_mode_str(bc_net_mode_t mode);
+
+// v19: socket 서버 주소 설정 (SPIFFS 영속화)
+//   클라이언트 모드: 지정된 host:port로 TCP 연결
+//   host=NULL 또는 빈 문자열이면 socket 모드 비활성화
+bool wifi_bridge_set_socket_host(const char* host, uint16_t port);
+const char* wifi_bridge_get_socket_host(void);
+uint16_t wifi_bridge_get_socket_port(void);
+
+// ----- v20: net protocol (socket 모드 내에서 TCP vs UDP vs UDP-bcast) -----
+//   bc_net_proto_t는 node_config.h에 정의됨
+//   TCP: 기존 length-prefix 프레이밍 (신뢰성 내장)
+//   UDP: 유니캐스트 UDP + ACK 재전송 (host 필요, 연결 설정 없음)
+//   UDP_BCAST: 브로드캐스트 UDP + ACK (LAN 자체 완결, host 불필요)
+//   Serial 'net proto tcp|udp|udp-bcast'로 변경 (SPIFFS /wifi.conf에 영속화)
+bool wifi_bridge_set_proto(bc_net_proto_t proto);
+bc_net_proto_t wifi_bridge_get_proto(void);
+const char* wifi_bridge_proto_str(bc_net_proto_t proto);
 
 #ifdef __cplusplus
 }

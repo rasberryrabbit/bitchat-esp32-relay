@@ -88,6 +88,14 @@ static void print_help(void) {
     Serial.println(F("dump            - show packet dump status (default OFF)"));
     Serial.println(F("dump on         - enable RX write + hex dump (RAM only, not persisted)"));
     Serial.println(F("dump off        - disable dump (performance-safe)"));
+    Serial.println(F("net             - net transport status (default SOCKET)"));
+    Serial.println(F("net mode socket - direct TCP socket (default, no broker)"));
+    Serial.println(F("net mode mqtt   - MQTT broker mode (binary, QoS 1)"));
+    Serial.println(F("net mode off    - disable internet bridge"));
+    Serial.println(F("net host <ip> <port> - socket server address (SPIFFS persisted)"));
+    Serial.println(F("net proto tcp   - TCP length-prefix (default, reliable)"));
+    Serial.println(F("net proto udp   - UDP unicast + ACK retransmit (host required)"));
+    Serial.println(F("net proto udp-bcast - UDP broadcast + ACK (LAN, no host needed)"));
     Serial.println(F("peer            - peer_keys mappings (senderID → Ed25519 pk)"));
     Serial.println(F("peer list       - list all peer keys"));
     Serial.println(F("peer clear      - clear all peer keys"));
@@ -529,6 +537,107 @@ static void handle_dump_command(char* args) {
     }
 }
 
+// ============================================================
+// v19: net transport Serial 명령 처리
+//
+// 지원 명령:
+//   net                 - 현재 transport mode + 연결 상태 출력
+//   net mode            - mode만 출력
+//   net mode socket     - 직접 TCP 소켓 모드 (기본값, 브로커 불필요)
+//   net mode mqtt       - MQTT 브로커 모드 (binary payload, QoS 1)
+//   net mode off        - 인터넷 전송 비활성화 (WiFi만)
+//   net host            - socket 서버 주소 출력
+//   net host <ip> <port>- socket 서버 주소 설정 (NVS 영속화)
+//
+// NVS 영속화: mode, host, port 모두 NVS에 저장. 재부팅 후 유지.
+// 기본값: mode=SOCKET, host=""(빈), port=8765
+// ============================================================
+static void handle_net_command(char* args) {
+    if (!args || *args == 0) {
+        // 전체 상태 출력
+        bc_net_mode_t mode = wifi_bridge_get_mode();
+        LOGI("net: mode=%s proto=%s, connected=%d, enabled=%d",
+             wifi_bridge_mode_str(mode),
+             (mode == BC_NET_MODE_SOCKET) ? wifi_bridge_proto_str(wifi_bridge_get_proto()) : "N/A",
+             wifi_bridge_is_connected() ? 1 : 0,
+             wifi_bridge_is_enabled() ? 1 : 0);
+        if (mode == BC_NET_MODE_SOCKET) {
+            const char* host = wifi_bridge_get_socket_host();
+            bc_net_proto_t proto = wifi_bridge_get_proto();
+            if (proto == BC_NET_PROTO_UDP_BCAST) {
+                LOGI("udp-bcast: port %u (LAN broadcast, no host needed)",
+                     wifi_bridge_get_socket_port());
+            } else {
+                LOGI("socket: %s:%u %s (proto=%s)",
+                     host[0] ? host : "(not set)",
+                     wifi_bridge_get_socket_port(),
+                     wifi_bridge_is_connected() ? "(connected)" : "(disconnected)",
+                     wifi_bridge_proto_str(proto));
+            }
+        } else if (mode == BC_NET_MODE_MQTT) {
+            LOGI("mqtt broker: %s:%u", wifi_bridge_get_broker(), wifi_bridge_get_port());
+        }
+        return;
+    }
+
+    char* cmd = args;
+    char* arg = strchr(args, ' ');
+    if (arg) { *arg++ = 0; }
+
+    if (strcmp(cmd, "mode") == 0) {
+        if (!arg || *arg == 0) {
+            LOGI("net mode: %s", wifi_bridge_mode_str(wifi_bridge_get_mode()));
+            return;
+        }
+        if (strcmp(arg, "socket") == 0) {
+            wifi_bridge_set_mode(BC_NET_MODE_SOCKET);
+        } else if (strcmp(arg, "mqtt") == 0) {
+            wifi_bridge_set_mode(BC_NET_MODE_MQTT);
+        } else if (strcmp(arg, "off") == 0) {
+            wifi_bridge_set_mode(BC_NET_MODE_OFF);
+        } else {
+            LOGE("usage: net mode [socket|mqtt|off]");
+        }
+    } else if (strcmp(cmd, "host") == 0) {
+        if (!arg || *arg == 0) {
+            const char* host = wifi_bridge_get_socket_host();
+            LOGI("socket host: %s:%u", host[0] ? host : "(not set)",
+                 wifi_bridge_get_socket_port());
+            return;
+        }
+        // net host <ip> <port>
+        char* host = arg;
+        char* port_str = strchr(arg, ' ');
+        if (!port_str) {
+            LOGE("usage: net host <ip> <port>");
+            return;
+        }
+        *port_str++ = 0;
+        long port = strtol(port_str, nullptr, 10);
+        if (port <= 0 || port > 65535) {
+            LOGE("net: invalid port %s", port_str);
+            return;
+        }
+        wifi_bridge_set_socket_host(host, (uint16_t)port);
+    } else if (strcmp(cmd, "proto") == 0) {
+        if (!arg || *arg == 0) {
+            LOGI("net proto: %s", wifi_bridge_proto_str(wifi_bridge_get_proto()));
+            return;
+        }
+        if (strcmp(arg, "tcp") == 0) {
+            wifi_bridge_set_proto(BC_NET_PROTO_TCP);
+        } else if (strcmp(arg, "udp") == 0) {
+            wifi_bridge_set_proto(BC_NET_PROTO_UDP);
+        } else if (strcmp(arg, "udp-bcast") == 0 || strcmp(arg, "bcast") == 0) {
+            wifi_bridge_set_proto(BC_NET_PROTO_UDP_BCAST);
+        } else {
+            LOGE("usage: net proto [tcp|udp|udp-bcast]");
+        }
+    } else {
+        LOGE("unknown net subcommand: %s (try: mode, host, proto)", cmd);
+    }
+}
+
 static void handle_peer_command(char* args) {
     if (!args || *args == 0 || strcmp(args, "list") == 0 || strcmp(args, "status") == 0) {
         peer_keys_debug_dump();
@@ -739,6 +848,8 @@ static void process_serial_input(void) {
                     handle_txpower_command(args);
                 } else if (strcmp(cmd, "dump") == 0) {
                     handle_dump_command(args);
+                } else if (strcmp(cmd, "net") == 0) {
+                    handle_net_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {
@@ -803,7 +914,7 @@ void setup() {
     delay(100);
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v18 (pointer-based queue + v17 TX power/dump)");
+    Serial.println(" v20 (hybrid TCP/UDP/UDP-bcast + MQTT)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");

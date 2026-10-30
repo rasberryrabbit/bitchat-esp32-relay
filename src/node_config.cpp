@@ -131,6 +131,21 @@ static void wifi_cb(const char* key, const char* value, void* ctx) {
         // "1", "true", "on", "yes" → true / 그 외 → false
         c->use_tls = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
                       strcmp(value, "on") == 0 || strcmp(value, "yes") == 0);
+    } else if (strcmp(key, "net_mode") == 0) {
+        // 0=off, 1=socket, 2=mqtt
+        int m = atoi(value);
+        if (m < 0 || m > 2) m = 1;  // 기본값 SOCKET
+        c->net_mode = (uint8_t)m;
+    } else if (strcmp(key, "socket_host") == 0) {
+        strncpy(c->socket_host, value, MAX_SOCKET_HOST_LEN);
+        c->socket_host[MAX_SOCKET_HOST_LEN] = 0;
+    } else if (strcmp(key, "socket_port") == 0) {
+        c->socket_port = (uint16_t)atoi(value);
+    } else if (strcmp(key, "net_proto") == 0) {
+        // 0=tcp, 1=udp, 2=udp-bcast
+        int p = atoi(value);
+        if (p < 0 || p > 2) p = 0;  // 기본값 TCP
+        c->net_proto = (uint8_t)p;
     }
 }
 
@@ -274,6 +289,12 @@ bool node_config_load_wifi(bc_wifi_config_t* cfg) {
     cfg->mqtt_port = BC_MQTT_PORT;
     strncpy(cfg->mqtt_topic_prefix, BC_MQTT_TOPIC_PREFIX, MAX_TOPIC_PREFIX_LEN);
     cfg->use_tls = false;  // 기본값: plain MQTT (port 1883)
+    // v19: socket 설정 기본값
+    cfg->net_mode = 1;     // 기본 SOCKET
+    cfg->socket_host[0] = 0;  // 빈 문자열 (미설정)
+    cfg->socket_port = 8765;  // 기본 포트
+    // v20: socket protocol 기본값
+    cfg->net_proto = 0;    // 기본 TCP
 
     parse_config_file(WIFI_CONFIG_FILE, wifi_cb, cfg);
 
@@ -310,13 +331,25 @@ bool node_config_save_wifi(const bc_wifi_config_t* cfg) {
     f.println(cfg->mqtt_topic_prefix);
     f.print("use_tls=");
     f.println(cfg->use_tls ? "1" : "0");
+    // v19: socket 설정 저장
+    f.print("net_mode=");
+    f.println((unsigned)cfg->net_mode);
+    f.print("socket_host=");
+    f.println(cfg->socket_host);
+    f.print("socket_port=");
+    f.println((unsigned)cfg->socket_port);
+    // v20: socket protocol 저장
+    f.print("net_proto=");
+    f.println((unsigned)cfg->net_proto);
     f.close();
 
     // 캐시 업데이트
     memcpy(&g_wifi_cache, cfg, sizeof(g_wifi_cache));
-    LOGI("node_config: saved /wifi.conf (ssid='%s', broker=%s:%u, tls=%s)",
+    LOGI("node_config: saved /wifi.conf (ssid='%s', broker=%s:%u, tls=%s, net_mode=%u, socket=%s:%u)",
          cfg->ssid, cfg->mqtt_broker, cfg->mqtt_port,
-         cfg->use_tls ? "ON" : "OFF");
+         cfg->use_tls ? "ON" : "OFF",
+         cfg->net_mode,
+         cfg->socket_host[0] ? cfg->socket_host : "(none)", cfg->socket_port);
     return true;
 }
 
@@ -393,4 +426,60 @@ int node_config_check_certs(void) {
     if (SPIFFS.exists(CLIENT_CERT_FILE)) mask |= 2;  // bit 1: client cert
     if (SPIFFS.exists(CLIENT_KEY_FILE))  mask |= 4;  // bit 2: client key
     return mask;
+}
+
+// ===== v19: net transport mode + socket 설정 (SPIFFS 영속화) =====
+
+bool node_config_set_net_mode(uint8_t mode) {
+    if (mode > 2) mode = 1;  // 범위 클램프, 기본 SOCKET
+    bc_wifi_config_t cfg;
+    node_config_load_wifi(&cfg);
+    cfg.net_mode = mode;
+    return node_config_save_wifi(&cfg);
+}
+
+uint8_t node_config_get_net_mode(void) {
+    return node_config_get_wifi()->net_mode;
+}
+
+bool node_config_set_socket_host(const char* host) {
+    bc_wifi_config_t cfg;
+    node_config_load_wifi(&cfg);
+    if (host && host[0]) {
+        strncpy(cfg.socket_host, host, MAX_SOCKET_HOST_LEN);
+        cfg.socket_host[MAX_SOCKET_HOST_LEN] = 0;
+    } else {
+        cfg.socket_host[0] = 0;
+    }
+    return node_config_save_wifi(&cfg);
+}
+
+const char* node_config_get_socket_host(void) {
+    return node_config_get_wifi()->socket_host;
+}
+
+bool node_config_set_socket_port(uint16_t port) {
+    if (port == 0) port = 8765;
+    bc_wifi_config_t cfg;
+    node_config_load_wifi(&cfg);
+    cfg.socket_port = port;
+    return node_config_save_wifi(&cfg);
+}
+
+uint16_t node_config_get_socket_port(void) {
+    return node_config_get_wifi()->socket_port;
+}
+
+// ===== v20: socket protocol (SPIFFS 영속화) =====
+
+bool node_config_set_net_proto(uint8_t proto) {
+    if (proto > 2) proto = 0;  // 범위 클램프, 기본 TCP
+    bc_wifi_config_t cfg;
+    node_config_load_wifi(&cfg);
+    cfg.net_proto = proto;
+    return node_config_save_wifi(&cfg);
+}
+
+uint8_t node_config_get_net_proto(void) {
+    return node_config_get_wifi()->net_proto;
 }

@@ -32,6 +32,9 @@ extern "C" {
 #define BC_NVS_KEY_SFF_EN  "sff_en"   // store-and-forward SPIFFS 캐시 enable (uint8_t, 0/1, 기본 1=ON)
 #define BC_NVS_KEY_DS_EN   "dpslp"    // 딥슬립 허용 플래그 (uint8_t, 0/1, 기본 0=OFF)
 #define BC_NVS_KEY_TXPWR   "txpwr"    // BLE TX power (int8_t dBm, 기본 9=+9dBm)
+#define BC_NVS_KEY_NETMODE "nmode"    // net transport mode (uint8_t, 0=off 1=socket 2=mqtt, 기본 1)
+#define BC_NVS_KEY_SOCKHOST "shost"   // socket server host (string, 최대 64B)
+#define BC_NVS_KEY_SOCKPORT "sport"   // socket server port (uint16_t, 기본 8765)
 #define BC_MAX_PEERS       32  // 최대 캐시 피어 수
 
 typedef struct {
@@ -180,6 +183,19 @@ bool storage_set_deep_sleep_enabled(bool enabled);
 
 int8_t storage_get_tx_power(void);              // 기본 +9 dBm
 bool storage_set_tx_power(int8_t dbm);          // NVS에 저장 + ble_relay에 즉시 적용
+
+// ----- v19: net transport mode (NVS 영속화) -----
+//   0=OFF, 1=SOCKET (기본, 직접 TCP), 2=MQTT (브로커)
+uint8_t storage_get_net_mode(void);             // 기본 1 (SOCKET)
+bool storage_set_net_mode(uint8_t mode);
+
+// ----- v19: socket server host/port (NVS 영속화) -----
+//   socket 모드에서 연결할 서버 주소. host 최대 63바이트 + NUL.
+//   host가 비어 있으면 socket 모드 비활성화.
+bool storage_get_socket_host(char* out, size_t out_max);  // 기본 "" (빈 문자열)
+bool storage_set_socket_host(const char* host);
+uint16_t storage_get_socket_port(void);                    // 기본 8765
+bool storage_set_socket_port(uint16_t port);
 
 #ifdef __cplusplus
 }

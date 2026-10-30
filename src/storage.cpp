@@ -375,3 +375,105 @@ bool storage_set_tx_power(int8_t dbm) {
     LOGI("tx_power=%+ddBm (persisted)", (int)dbm);
     return true;
 }
+
+// ----- v19: net transport mode (NVS 영속화) -----
+
+uint8_t storage_get_net_mode(void) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 1;  // 기본값 SOCKET
+    }
+    uint8_t val = 1;  // 기본값 SOCKET
+    esp_err_t err = nvs_get_u8(h, BC_NVS_KEY_NETMODE, &val);
+    nvs_close(h);
+    if (err != ESP_OK) return 1;  // 키 없으면 기본값
+    if (val > 2) val = 1;  // 범위 체크
+    return val;
+}
+
+bool storage_set_net_mode(uint8_t mode) {
+    if (mode > 2) mode = 1;  // 범위 클램프
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        LOGE("storage: NVS open failed for net_mode");
+        return false;
+    }
+    esp_err_t err = nvs_set_u8(h, BC_NVS_KEY_NETMODE, mode);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        LOGE("storage: NVS set net_mode failed: 0x%04x", err);
+        return false;
+    }
+    return true;
+}
+
+// ----- v19: socket server host/port (NVS 영속화) -----
+
+bool storage_get_socket_host(char* out, size_t out_max) {
+    if (!out || out_max == 0) return false;
+    out[0] = 0;  // 기본 빈 문자열
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    // nvs_get_str은 NUL 포함 크기 필요
+    size_t required = out_max;
+    esp_err_t err = nvs_get_str(h, BC_NVS_KEY_SOCKHOST, out, &required);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        out[0] = 0;
+        return false;
+    }
+    return true;
+}
+
+bool storage_set_socket_host(const char* host) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        LOGE("storage: NVS open failed for socket_host");
+        return false;
+    }
+    const char* val = host ? host : "";
+    esp_err_t err = nvs_set_str(h, BC_NVS_KEY_SOCKHOST, val);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        LOGE("storage: NVS set socket_host failed: 0x%04x", err);
+        return false;
+    }
+    return true;
+}
+
+uint16_t storage_get_socket_port(void) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 8765;  // 기본값
+    }
+    uint16_t val = 8765;
+    // uint16_t 저장을 위해 uint32_t 사용 (NVS는 u8/u16/u32 지원하지만 u16은 일부 버전에서만)
+    uint32_t raw = 8765;
+    esp_err_t err = nvs_get_u32(h, BC_NVS_KEY_SOCKPORT, &raw);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        val = (uint16_t)(raw & 0xFFFF);
+    }
+    return val;
+}
+
+bool storage_set_socket_port(uint16_t port) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        LOGE("storage: NVS open failed for socket_port");
+        return false;
+    }
+    uint32_t val = port;
+    esp_err_t err = nvs_set_u32(h, BC_NVS_KEY_SOCKPORT, val);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        LOGE("storage: NVS set socket_port failed: 0x%04x", err);
+        return false;
+    }
+    return true;
+}
