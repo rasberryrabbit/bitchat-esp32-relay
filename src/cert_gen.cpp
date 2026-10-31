@@ -133,10 +133,12 @@ bool cert_generate_self_signed(const char* cn) {
     if (ret != 0) { LOGE("cert_gen: CA ku: -0x%04x", -ret); goto done; }
 
     // Write CA PEM — use PEM_BUF_SIZE not sizeof(pem) (which is pointer size=4)
+    // mbedTLS mbedtls_x509write_crt_pem returns 0 on success (not length),
+    // negative on error. Check ret < 0, not ret <= 0.
     memset(pem, 0, PEM_BUF_SIZE);
     ret = mbedtls_x509write_crt_pem(&ca_crt, pem, PEM_BUF_SIZE,
                                      mbedtls_ctr_drbg_random, &ctr_drbg);
-    if (ret <= 0) { LOGE("cert_gen: CA PEM: -0x%04x", -ret); goto done; }
+    if (ret < 0) { LOGE("cert_gen: CA PEM: -0x%04x", -ret); goto done; }
     {
         size_t ca_len = strlen((char*)pem);
         if (!write_pem_file("/broker_ca.pem", pem, ca_len)) goto done;
@@ -168,10 +170,11 @@ bool cert_generate_self_signed(const char* cn) {
     if (ret != 0) { LOGE("cert_gen: cli ku: -0x%04x", -ret); goto done; }
 
     // Write client cert PEM — reuse same buffer
+    // Same fix: ret < 0 (not <= 0), since 0 = success
     memset(pem, 0, PEM_BUF_SIZE);
     ret = mbedtls_x509write_crt_pem(&cli_crt, pem, PEM_BUF_SIZE,
                                      mbedtls_ctr_drbg_random, &ctr_drbg);
-    if (ret <= 0) { LOGE("cert_gen: cli PEM: -0x%04x", -ret); goto done; }
+    if (ret < 0) { LOGE("cert_gen: cli PEM: -0x%04x", -ret); goto done; }
     {
         size_t cli_len = strlen((char*)pem);
         if (!write_pem_file("/client_cert.pem", pem, cli_len)) goto done;
