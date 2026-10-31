@@ -27,6 +27,7 @@
 #include "peer_keys.h"   // senderID → Ed25519 pk 매핑 (서명 검증용)
 #include "packet_splitter.h"   // 큰 패킷 분할/재조립 - LoRa 메시 전용
 #include "msg_cache.h"          // store-and-forward 메시지 캐시
+#include "cert_gen.h"           // v25: 자체 서명 인증서 자동 생성
 #include "msg_store.h"          // SPIFFS overflow backend for msg_cache
 #include "node_config.h"        // SPIFFS-based node profile + wifi/mqtt config
 
@@ -106,6 +107,7 @@ static void print_help(void) {
     Serial.println(F("node nick <name>- set node nickname (SPIFFS persisted)"));
     Serial.println(F("node nick clear  - remove nickname"));
     Serial.println(F("cert status          - show cert files status (CA/client/key)"));
+    Serial.println(F("cert gen [cn]        - auto-generate self-signed CA + client certs (mbedTLS)"));
     Serial.println(F("cert upload <ca|client|key> - paste PEM (end with 'EOF' on its own line)"));
     Serial.println(F("cert clear           - delete all cert PEM files"));
     Serial.println(F("help            - this help"));
@@ -770,6 +772,17 @@ static void handle_cert_command(char* args) {
         if (!upload_pem(path)) {
             LOGE("cert: upload failed for %s", path);
         }
+    } else if (strcmp(cmd, "gen") == 0) {
+        // v25: cert gen [cn] - 자체 서명 인증서 자동 생성
+        LOGI("cert gen: starting self-signed certificate generation...");
+        LOGI("cert gen: RSA 2048-bit, SHA-256, valid 10 years");
+        LOGI("cert gen: this blocks for ~10-30 seconds (RSA key generation)");
+        const char* cn = (arg && *arg) ? arg : nullptr;
+        if (cert_generate_self_signed(cn)) {
+            // 생성 성공 시 TLS 자동 활성화
+            LOGI("cert gen: auto-enabling TLS (net tls on)");
+            wifi_bridge_set_tls_enabled(true);
+        }
     } else if (strcmp(cmd, "clear") == 0) {
         bool removed_any = false;
         if (SPIFFS.remove(BROKER_CA_FILE))   removed_any = true;
@@ -904,7 +917,7 @@ void setup() {
     delay(100);
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v24 (open WiFi auto-scan fallback)");
+    Serial.println(" v25 (auto cert generation)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
