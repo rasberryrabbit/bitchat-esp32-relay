@@ -297,6 +297,80 @@ bool wifi_bridge_init(void) {
     return true;
 }
 
+// v24: 오픈 WiFi 자동 스캔 + 연결
+//   SSID/password가 설정되지 않았을 때 주변 오픈 AP를 스캔하여 자동 연결.
+//   우선순위: 신호 세기(RSSI)가 가장 강한 오픈 AP 선택.
+//   보안 경고: 오픈 AP는 암호화 없음. TLS(net tls on) 사용 권장.
+static bool wifi_connect_open_auto(void) {
+    LOGI("wifi: no SSID configured, scanning for open networks...");
+    WiFi.mode(WIFI_STA);
+    int n = WiFi.scanNetworks(false, false);  // async=false, show_hidden=false
+    if (n <= 0) {
+        LOGE("wifi: no networks found");
+        return false;
+    }
+
+    // 신호가 가장 강한 오픈 AP 찾기
+    int best_idx = -1;
+    int best_rssi = -999;
+    for (int i = 0; i < n; i++) {
+        const char* ssid_str = WiFi.SSID(i).c_str();
+        wifi_auth_mode_t enc = WiFi.encryptionType(i);
+        int rssi = WiFi.RSSI(i);
+
+        // 오픈 AP = WIFI_AUTH_OPEN (0)
+        if (enc != WIFI_AUTH_OPEN) {
+            LOGD("wifi: [%d] \"%s\" rssi=%d enc=%d (not open, skip)",
+                 i, ssid_str, rssi, (int)enc);
+            continue;
+        }
+        if (ssid_str[0] == 0) {
+            LOGD("wifi: [%d] hidden network rssi=%d (skip)", i, rssi);
+            continue;
+        }
+        LOGD("wifi: [%d] \"%s\" rssi=%d OPEN", i, ssid_str, rssi);
+        if (rssi > best_rssi) {
+            best_rssi = rssi;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx < 0) {
+        LOGE("wifi: no open networks found among %d networks", n);
+        WiFi.scanDelete();
+        return false;
+    }
+
+    String best_ssid = WiFi.SSID(best_idx);
+    LOGI("wifi: connecting to open AP \"%s\" rssi=%d ...",
+         best_ssid.c_str(), best_rssi);
+    WiFi.scanDelete();  // 스캔 결과 메모리 해제
+
+    // 오픈 AP 연결 (password 없음)
+    WiFi.begin(best_ssid.c_str(), nullptr);
+
+    // 최대 15초 대기
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+        delay(200);
+        if ((millis() - start) % 1000 < 200) {
+            Serial.print(".");
+        }
+    }
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        LOGE("wifi: open AP connection failed (status=%d)", WiFi.status());
+        return false;
+    }
+
+    LOGI("wifi: connected to open AP \"%s\"! IP=%s, RSSI=%d dBm",
+         best_ssid.c_str(),
+         WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    LOGW("wifi: open AP has no encryption - use 'net tls on' for transport security");
+    return true;
+}
+
 bool wifi_bridge_begin_connection(const char* ssid, const char* password) {
     if (!g_init_done) wifi_bridge_init();
 
@@ -316,39 +390,49 @@ bool wifi_bridge_begin_connection(const char* ssid, const char* password) {
             strncpy(actual_ssid, BC_WIFI_SSID, sizeof(actual_ssid) - 1);
             strncpy(actual_pass, BC_WIFI_PASS, sizeof(actual_pass) - 1);
 #else
-            LOGE("wifi: no SSID/password configured (use 'wifi set <ssid> <pass>' "
-                 "or -DBC_WIFI_SSID=...)");
-            return false;
+            // v24: 컴파일 타임 매크로도 없으면 오픈 WiFi 자동 스캔
+            actual_ssid[0] = 0;  // 빈 SSID → 아래에서 오픈 WiFi 자동 연결
 #endif
         }
     }
 
+    // v24: SSID가 없으면 오픈 WiFi 자동 스캔 + 연결
     if (actual_ssid[0] == 0) {
-        LOGE("wifi: empty SSID");
-        return false;
-    }
-
-    LOGI("wifi: connecting to SSID=%s ...", actual_ssid);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(actual_ssid, actual_pass);
-
-    // 최대 15초 대기
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-        delay(200);
-        if ((millis() - start) % 1000 < 200) {
-            Serial.print(".");
+        if (!wifi_connect_open_auto()) {
+            g_wifi_connected = false;
+            return false;
         }
-    }
-    Serial.println();
+        g_wifi_connected = true;
+        g_enabled = true;
+    } else {
+        // 기존: 지정된 SSID로 연결
+        LOGI("wifi: connecting to SSID=%s ...", actual_ssid);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(actual_ssid, actual_pass);
 
-    if (WiFi.status() != WL_CONNECTED) {
-        LOGE("wifi: connection failed (status=%d)", WiFi.status());
-        g_wifi_connected = false;
-        return false;
+        // 최대 15초 대기
+        uint32_t start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+            delay(200);
+            if ((millis() - start) % 1000 < 200) {
+                Serial.print(".");
+            }
+        }
+        Serial.println();
+
+        if (WiFi.status() != WL_CONNECTED) {
+            // v24: 지정된 SSID 연결 실패 시 오픈 WiFi 자동 스캔으로 fallback
+            LOGW("wifi: SSID \"%s\" connection failed (status=%d), trying open WiFi...",
+                 actual_ssid, WiFi.status());
+            if (!wifi_connect_open_auto()) {
+                g_wifi_connected = false;
+                return false;
+            }
+        }
+        g_wifi_connected = true;
+        g_enabled = true;
     }
-    g_wifi_connected = true;
-    g_enabled = true;
+
     LOGI("wifi: connected! IP=%s, RSSI=%d dBm",
          WiFi.localIP().toString().c_str(), WiFi.RSSI());
 

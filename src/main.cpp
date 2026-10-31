@@ -67,7 +67,7 @@ static void print_help(void) {
     Serial.println(F("bl stats        - counts only"));
     // v21: wifi 명령은 net으로 통합. 'wifi'는 'net'의 deprecated 별명.
     Serial.println(F("net             - net status (WiFi + transport)"));
-    Serial.println(F("net on [ssid p] - connect WiFi + transport (SSID spaces OK)"));
+    Serial.println(F("net on [ssid p] - connect WiFi (no SSID = auto open WiFi scan)"));
     Serial.println(F("net off         - disconnect"));
     Serial.println(F("net set <ssid> <pass> - save WiFi creds (SPIFFS)"));
     Serial.println(F("net stat        - detailed stats"));
@@ -904,7 +904,7 @@ void setup() {
     delay(100);
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v23 (LoRa chunk reliability: delay + retry + timeout)");
+    Serial.println(" v24 (open WiFi auto-scan fallback)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
