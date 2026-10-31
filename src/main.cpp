@@ -774,14 +774,41 @@ static void handle_cert_command(char* args) {
         }
     } else if (strcmp(cmd, "gen") == 0) {
         // v25: cert gen [cn] - 자체 서명 인증서 자동 생성
+        // 별도 FreeRTOS 태스크에서 실행 (mbedTLS가 큰 스택 사용, loopTask 8KB 초과)
         LOGI("cert gen: starting self-signed certificate generation...");
         LOGI("cert gen: RSA 2048-bit, SHA-256, valid 10 years");
-        LOGI("cert gen: this blocks for ~10-30 seconds (RSA key generation)");
-        const char* cn = (arg && *arg) ? arg : nullptr;
-        if (cert_generate_self_signed(cn)) {
-            // 생성 성공 시 TLS 자동 활성화
-            LOGI("cert gen: auto-enabling TLS (net tls on)");
-            wifi_bridge_set_tls_enabled(true);
+        LOGI("cert gen: runs in separate task (~30s), BLE continues running");
+
+        // CN 문자열 복사 (태스크에 전달)
+        char* cn_copy = nullptr;
+        if (arg && *arg) {
+            size_t cn_len = strlen(arg);
+            cn_copy = (char*)malloc(cn_len + 1);
+            if (cn_copy) {
+                strcpy(cn_copy, arg);
+            }
+        }
+
+        // 16KB 스택 태스크에서 cert gen 실행
+        BaseType_t tc = xTaskCreate(
+            [](void* param) {
+                const char* cn = (const char*)param;
+                if (cert_generate_self_signed(cn)) {
+                    LOGI("cert gen: auto-enabling TLS (net tls on)");
+                    wifi_bridge_set_tls_enabled(true);
+                }
+                if (param) free(param);
+                vTaskDelete(nullptr);
+            },
+            "certgen",     // 태스크명
+            16384,         // 스택 16KB (loopTask 8KB의 2배)
+            cn_copy,       // CN 문자열
+            5,             // 우선순위
+            nullptr        // 핸들 불필요
+        );
+        if (tc != pdPASS) {
+            LOGE("cert gen: failed to create task (heap exhausted?)");
+            if (cn_copy) free(cn_copy);
         }
     } else if (strcmp(cmd, "clear") == 0) {
         bool removed_any = false;
