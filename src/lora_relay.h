@@ -21,8 +21,8 @@
  *   한계:
  *     - SX127x만 지원 (SX1262/1268은 다른 라이브러리 필요)
  *     - 단일 주파수 채널 (FHSS 미구현)
- *     - 큰 패킷(>222B)은 LoRa 프레임에 안 들어감 → drop
- *     - LoRa 통신 속도 느림 (SF7, BW125 → ~5800 bps)
+ *     - 큰 패킷(>222B)은 packet_splitter로 분할/재조립
+ *     - v23: inter-chunk delay 200ms + TX 재시도 + 타임아웃 15s
  */
 
 #pragma once

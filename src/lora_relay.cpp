@@ -142,18 +142,25 @@ typedef struct {
 } split_send_ctx_t;
 
 // 청크 단위 TX 콜백 - splitter_send_chunks가 호출
+// v23: TX 실패 시 1회 재시도 (LoRa 일시적 충돌 대응)
 static bool chunk_tx_callback(const uint8_t* chunk, size_t len, void* user_data) {
     (void)user_data;
-    LoRa.beginPacket();
-    LoRa.write(chunk, len);
-    int rc = LoRa.endPacket();
-    if (rc != 1) {
-        LOGW("lora: chunk TX fail (len=%u)", (unsigned)len);
-        return false;
+    for (int attempt = 0; attempt < 2; attempt++) {  // 최대 2회 시도
+        LoRa.beginPacket();
+        LoRa.write(chunk, len);
+        int rc = LoRa.endPacket();
+        if (rc == 1) {
+            // 수신 모드로 복귀 (LoRa는 TX 후 자동 복귀 안 됨)
+            LoRa.receive();
+            return true;
+        }
+        if (attempt == 0) {
+            LOGW("lora: chunk TX fail, retrying (len=%u)", (unsigned)len);
+            delay(100);  // 재시도 전 짧은 대기
+        }
     }
-    // 수신 모드로 복귀 (LoRa는 TX 후 자동 복귀 안 됨)
-    LoRa.receive();
-    return true;
+    LOGW("lora: chunk TX fail after retry (len=%u)", (unsigned)len);
+    return false;
 }
 
 bool lora_relay_broadcast(const uint8_t* data, size_t len) {

@@ -45,13 +45,21 @@ extern "C" {
 #define BC_CHUNK_HEADER_LEN     14    // magic + ver + total + index + hash(8) + payload_len(2)
 #define BC_MAX_CHUNKS_PER_PACKET 16
 
-// LoRa 프레임 한계 222B → 청크 페이로드 = 222 - 14 = 208B
+// LoRa 프레임 한계 222B -> 청크 페이로드 = 222 - 14 = 208B
 #ifndef BC_CHUNK_PAYLOAD_MAX
 #define BC_CHUNK_PAYLOAD_MAX    208
 #endif
 
-// 재조립 타임아웃 (30초)
-#define BC_CHUNK_TIMEOUT_MS     30000
+// v23: 재조립 타임아웃 30s -> 15s (LoRa 특성에 맞게 단축)
+//   SF7/BW125: 222B 전송 ~300ms, 4청크 순차 ~1.2s + 여유 → 15s면 충분
+#define BC_CHUNK_TIMEOUT_MS     15000
+
+// v23: 청크 송신 간 inter-chunk delay (ms)
+//   LoRa는 TX 후 수신 모드로 복귀하는 데 시간 필요 + 충돌 방지
+//   너무 짧으면 청크 손실 위험, 너무 길면 지연. 200ms가 균형점.
+#ifndef BC_CHUNK_TX_DELAY_MS
+#define BC_CHUNK_TX_DELAY_MS    200
+#endif
 
 // 전송 콜백 타입 - 각 청크마다 호출
 // 예: LoRa TX (LoRa.beginPacket/write/endPacket)
@@ -66,8 +74,16 @@ bool splitter_init(void);
 // tx: 각 청크 송신 시 호출되는 콜백
 // user_data: 콜백에 전달할 사용자 데이터 (예: lora_relay 인스턴스)
 // 반환: 모든 청크 송신 성공 시 true
+// v23: 청크 간 BC_CHUNK_TX_DELAY_MS 지연 추가 (LoRa 충돌 방지)
 bool splitter_send_chunks(const uint8_t* packet, size_t packet_len,
                           chunk_tx_fn tx, void* user_data);
+
+// v23: 특정 hash의 누락 청크 재송신
+//   수신 측에서 NACK를 보낼 수 없는 LoRa 환경에서,
+//   송신 측이 자체적으로 재송신 관리. (타임아웃 기반)
+//   현재는 단순 구현: send_chunks 시 모든 청크 1회 전송 후 종료.
+//   향후 ACK/NACK 프로토콜 추가 시 확장 예정.
+//   (현재 버전에서는 inter-chunk delay + CRC로 신뢰성 향상에 집중)
 
 // 청크 수신 - 한 청크 처리
 // chunk: 수신한 청크 (BC_CHUNK_MAGIC 0xCF로 시작)

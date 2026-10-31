@@ -108,6 +108,12 @@ bool splitter_send_chunks(const uint8_t* packet, size_t packet_len,
         }
         LOGD("splitter: TX chunk %u/%u (%u bytes payload)",
              (unsigned)i, (unsigned)num_chunks, (unsigned)this_payload_len);
+
+        // v23: 청크 간 inter-chunk delay (LoRa 충돌 방지 + 수신 모드 복귀 시간)
+        // 마지막 청크는 delay 불필요
+        if (i < num_chunks - 1 && BC_CHUNK_TX_DELAY_MS > 0) {
+            delay(BC_CHUNK_TX_DELAY_MS);
+        }
     }
     g_total_split++;
     LOGI("splitter: sent %u chunks for packet (total_len=%u, hash=0x%02x%02x%02x%02x)",
