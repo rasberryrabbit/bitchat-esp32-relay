@@ -13,17 +13,24 @@
 
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <esp_system.h>  // esp_fill_random
 
 #include <mbedtls/rsa.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/x509_crt.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
 #include <mbedtls/bignum.h>
 #include <string.h>
 
 #define CERT_KEY_BITS    2048
 #define PEM_BUF_SIZE     4096
+
+// v39i: CTR_DRBG 우회 — ESP32 하드웨어 RNG를 직접 사용
+//   mbedtls_ctr_drbg_seed가 S3에서 크래시 → CTR_DRBG 전체 우회
+//   하드웨어 RNG(esp_fill_random)는 C3/S3 모두 안정 동작
+static int hw_random(void *ctx, unsigned char *output, size_t len) {
+    esp_fill_random(output, len);
+    return 0;
+}
 
 static bool write_pem_file(const char* path, const unsigned char* pem, size_t len) {
     File f = SPIFFS.open(path, "w");
@@ -61,20 +68,19 @@ bool cert_generate_self_signed(const char* cn) {
 
     mbedtls_pk_context ca_key, client_key;
     mbedtls_x509write_cert ca_crt, cli_crt;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
     mbedtls_mpi serial;
 
     mbedtls_pk_init(&ca_key);
     mbedtls_pk_init(&client_key);
     mbedtls_x509write_crt_init(&ca_crt);
     mbedtls_x509write_crt_init(&cli_crt);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_mpi_init(&serial);
 
-    // v25-fix: single reusable PEM buffer (was 3 × 4KB = 12KB, caused heap exhaustion)
+    // v39c: PEM 버퍼는 내부 RAM 전용
     unsigned char* pem = (unsigned char*)malloc(PEM_BUF_SIZE);
+    if (pem) {
+        LOGI("cert_gen: PEM buffer %uB from internal RAM", PEM_BUF_SIZE);
+    }
     bool ok = false;
     int ret;
 
@@ -83,33 +89,32 @@ bool cert_generate_self_signed(const char* cn) {
         goto done_no_pem;
     }
 
-    // Seed RNG
-    ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                                (const unsigned char*)"bitchat", 7);
-    if (ret != 0) { LOGE("cert_gen: drbg seed: -0x%04x", -ret); goto done; }
+    // v39i: CTR_DRBG 우회 — mbedtls_ctr_drbg_seed 호출 안 함
+    //   대신 hw_random(esp_fill_random)을 모든 RNG 호출에 직접 사용
+    LOGI("cert_gen: heap=%uB — using HW RNG (CTR_DRBG bypassed)", (unsigned)ESP.getFreeHeap());
 
     ret = mbedtls_mpi_lset(&serial, 1);
     if (ret != 0) { LOGE("cert_gen: serial: -0x%04x", -ret); goto done; }
 
-    // Generate CA key
-    LOGI("cert_gen: generating CA key...");
+    // Generate CA key — hw_random 직접 사용 (ctr_drbg 없음)
+    LOGI("cert_gen: heap=%uB — generating CA key...", (unsigned)ESP.getFreeHeap());
     ret = mbedtls_pk_setup(&ca_key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
     if (ret != 0) { LOGE("cert_gen: CA pk_setup: -0x%04x", -ret); goto done; }
     ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(ca_key),
-                              mbedtls_ctr_drbg_random, &ctr_drbg,
+                              hw_random, nullptr,
                               CERT_KEY_BITS, 65537);
     if (ret != 0) { LOGE("cert_gen: CA rsa_gen: -0x%04x", -ret); goto done; }
-    LOGI("cert_gen: CA key done");
+    LOGI("cert_gen: CA key done (heap=%uB)", (unsigned)ESP.getFreeHeap());
 
     // Generate client key
-    LOGI("cert_gen: generating client key...");
+    LOGI("cert_gen: heap=%uB — generating client key...", (unsigned)ESP.getFreeHeap());
     ret = mbedtls_pk_setup(&client_key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
     if (ret != 0) { LOGE("cert_gen: cli pk_setup: -0x%04x", -ret); goto done; }
     ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(client_key),
-                              mbedtls_ctr_drbg_random, &ctr_drbg,
+                              hw_random, nullptr,
                               CERT_KEY_BITS, 65537);
     if (ret != 0) { LOGE("cert_gen: cli rsa_gen: -0x%04x", -ret); goto done; }
-    LOGI("cert_gen: client key done");
+    LOGI("cert_gen: client key done (heap=%uB)", (unsigned)ESP.getFreeHeap());
 
     // Build CA cert (self-signed)
     LOGI("cert_gen: building CA certificate...");
@@ -137,7 +142,7 @@ bool cert_generate_self_signed(const char* cn) {
     // negative on error. Check ret < 0, not ret <= 0.
     memset(pem, 0, PEM_BUF_SIZE);
     ret = mbedtls_x509write_crt_pem(&ca_crt, pem, PEM_BUF_SIZE,
-                                     mbedtls_ctr_drbg_random, &ctr_drbg);
+                                     hw_random, nullptr);
     if (ret < 0) { LOGE("cert_gen: CA PEM: -0x%04x", -ret); goto done; }
     {
         size_t ca_len = strlen((char*)pem);
@@ -173,7 +178,7 @@ bool cert_generate_self_signed(const char* cn) {
     // Same fix: ret < 0 (not <= 0), since 0 = success
     memset(pem, 0, PEM_BUF_SIZE);
     ret = mbedtls_x509write_crt_pem(&cli_crt, pem, PEM_BUF_SIZE,
-                                     mbedtls_ctr_drbg_random, &ctr_drbg);
+                                     hw_random, nullptr);
     if (ret < 0) { LOGE("cert_gen: cli PEM: -0x%04x", -ret); goto done; }
     {
         size_t cli_len = strlen((char*)pem);
@@ -207,8 +212,6 @@ done_no_pem:
     mbedtls_pk_free(&ca_key);
     mbedtls_pk_free(&client_key);
     mbedtls_mpi_free(&serial);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    mbedtls_entropy_free(&entropy);
     if (!ok) LOGE("cert_gen: failed");
     return ok;
 }

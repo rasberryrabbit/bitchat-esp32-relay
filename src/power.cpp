@@ -96,13 +96,12 @@ bool power_init(const power_config_t* cfg) {
     pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(BC_POWER_IS_S3)
-    // v36: S3 DFS도 max=min=160 고정 (0x0106 에러 제거, C3과 동일 방식)
-    esp_pm_config_esp32s3_t pm_cfg;
-    memset(&pm_cfg, 0, sizeof(pm_cfg));
-    pm_cfg.max_freq_mhz       = 160;     // S3 고정 160MHz
-    pm_cfg.min_freq_mhz       = 160;     // v36: 80→160 (DFS 비활성, 에러 방지)
-    pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
-    esp_err_t rc = esp_pm_configure(&pm_cfg);
+    // v39d: S3에서 esp_pm_configure 완전 스킵 (0x0106 에러 + PM 서브시스템 불안정 근본 해결)
+    //   이전: max=min=160 설정해도 0x0106 반환 → PM 서브시스템이 불완전 상태
+    //   → cert gen 등 heavy operation에서 크래시 유발
+    //   해결: PM 호출 자체를 안 함 → CPU 부팅 주파수(160MHz) 고정, PM 서브시스템 건드리지 않음
+    LOGI("power: S3 PM skipped (fixed 160MHz, no DFS, most stable)");
+    esp_err_t rc = ESP_OK;  // 스킵 → 에러 없음
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
     rc = ESP_OK;
 #else

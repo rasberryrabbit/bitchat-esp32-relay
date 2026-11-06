@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include "log.h"
@@ -95,6 +96,7 @@ static void print_help(void) {
     Serial.println(F("dump off        - disable dump (performance-safe)"));
     Serial.println(F("temp            - show chip temperature + thermal mode"));
     Serial.println(F("temp threshold <50-85> - set temp threshold (default 65C, NVS persisted)"));
+    Serial.println(F("psram           - show PSRAM + internal RAM usage (S3 only)"));
     Serial.println(F("net mode socket - direct TCP socket (default, no broker)"));
     Serial.println(F("net mode mqtt   - MQTT broker mode (binary, QoS 1)"));
     Serial.println(F("net mode off    - disable internet bridge"));
@@ -461,6 +463,17 @@ static void handle_dump_command(char* args) {
     } else {
         LOGE("usage: dump [on|off]");
     }
+}
+
+// v39f: 메모리 상태 (PSRAM 비활성화 시 단순 출력)
+static void handle_psram_command(char* args) {
+    Serial.println("=== memory ===");
+    Serial.printf("  min free heap: %u bytes\n", (unsigned)ESP.getMinFreeHeap());
+#if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM
+    Serial.println("  PSRAM: enabled");
+#else
+    Serial.println("  PSRAM: disabled (v39f - mbedTLS stability)");
+#endif
 }
 
 // v34: 칩 내부 온도 출력 + 임계값 설정 + 모니터링 제어
@@ -850,38 +863,28 @@ static void handle_cert_command(char* args) {
             }
         }
 
-        // v36: cert gen 태스크 개선 (S3 리셋 문제 해결)
-        //   - core 0에서 실행 (mbedTLS는 core 0에 최적화, core 1은 불안정)
-        //   - 스택 48KB (32KB→48KB, RSA 2048 + X509 안전 마진)
-        //   - WDT 30초로 연장 (RSA 생성 10-20초, 5초 WDT 타임아웃 방지)
-        //   - 우선순위 1 (BLE/WiFi 우선 처리)
+        // v39j: cert gen 태스크 (CTR_DRBG 우회 + HW MPI + 32KB 스택)
         BaseType_t tc = xTaskCreatePinnedToCore(
             [](void* param) {
                 const char* cn = (const char*)param;
-                // v36: WDT 30초로 연장, 패닉 비활성 (RSA 생성 중 안전)
-                esp_task_wdt_init(30, false);
-                LOGI("cert gen: free heap=%uB, stack task created",
+                vTaskDelay(100);
+                LOGI("cert gen: free heap=%uB, stack=32KB (HW RNG + HW MPI)",
                      (unsigned)ESP.getFreeHeap());
                 if (cert_generate_self_signed(cn)) {
                     LOGI("cert gen: auto-enabling TLS (net tls on)");
                     wifi_bridge_set_tls_enabled(true);
                 }
-                // WDT 정상 설정으로 복귀
-                esp_task_wdt_init(5, true);
+                LOGI("cert gen: free heap=%uB (after)", (unsigned)ESP.getFreeHeap());
                 if (param) free(param);
                 vTaskDelete(nullptr);
             },
-            "certgen",     // 태스크명
-            49152,         // v36: 스택 48KB (32KB→48KB)
-            cn_copy,       // CN 문자열
-            1,             // 우선순위 1 (BLE/WiFi 우선)
-            nullptr,       // 핸들 불필요
-            0              // v36: core 0 고정 (mbedTLS 안정성)
+            "certgen",
+            32768,         // v39j: 24KB→32KB (클라이언트 키 생성 스택 마진)
+            cn_copy,
+            1,
+            nullptr,
+            0
         );
-        if (tc != pdPASS) {
-            LOGE("cert gen: failed to create task (heap exhausted?)");
-            if (cn_copy) free(cn_copy);
-        }
     } else if (strcmp(cmd, "clear") == 0) {
         bool removed_any = false;
         if (SPIFFS.remove(BROKER_CA_FILE))   removed_any = true;
@@ -954,6 +957,8 @@ static void process_serial_input(void) {
                     handle_dump_command(args);
                 } else if (strcmp(cmd, "temp") == 0) {
                     handle_temp_command(args);
+                } else if (strcmp(cmd, "psram") == 0 || strcmp(cmd, "mem") == 0) {
+                    handle_psram_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {
@@ -1014,17 +1019,11 @@ static void process_serial_input(void) {
 void setup() {
     // 시리얼 초기화 - USB serial (디버깅/최초 설정용)
     // 배터리 모드에서도 USB가 연결된 동안은 로그 출력
-    // v26: USB CDC 보드 (C3/S3 Super Mini)에서 CDC 열거 대기
+    // v26: USB CDC 보드 (C3 Super Mini)에서 CDC 열거 대기
     Serial.begin(115200);
 #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
-    // v29: USBCDC (S3 TinyUSB)는 enableReboot(false)로 DTR/RTS 리셋 비활성화
-    //   시리얼 모니터 종료 시 DTR 드롭으로 인한 자동 리셋 방지
-    //   HWCDC (C3 USB Serial/JTAG)는 enableReboot() 메서드가 없어서
-    //   platformio.ini의 monitor_rts=0/monitor_dtr=0로 보조 제어
-#if defined(BOARD_VARIANT_ESP32S3)
-    Serial.enableReboot(false);  // S3: USBCDC DTR/RTS 리셋 비활성
-    Serial.println("USB CDC reboot disabled (S3)");
-#endif
+    // C3 HWCDC: enableReboot() 메서드 없음
+    // platformio.ini의 monitor_rts=0/monitor_dtr=0로 DTR/RTS 리셋 방지
     // USB CDC는 호스트가 열거할 때까지 대기 필요 (최대 3초)
     // 없으면 부팅 로그가 호스트가 포트를 열기 전에 출력되어 손실
     uint32_t usb_start = millis();
@@ -1037,12 +1036,10 @@ void setup() {
 #endif
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v36b (S3-DFS-fix + cert-gen-48KB-core0-WDT30)");
+    Serial.println(" v40 (2-board-only: C3 + esp32dev, CTR_DRBG-bypass)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 Super Mini (RISC-V, BLE 5.0, USB CDC)");
-#elif defined(BOARD_VARIANT_ESP32S3)
-    Serial.println(" target: ESP32-S3 Super Mini (FH4R2: 4MB Flash + 2MB PSRAM, USB CDC)");
 #elif defined(BOARD_VARIANT_ESP32)
     Serial.println(" target: ESP32 classic (Xtensa LX6, BLE 4.2)");
 #else

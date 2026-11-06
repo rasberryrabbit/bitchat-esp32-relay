@@ -24,6 +24,7 @@
 #include <cstring>
 #include <algorithm>
 #include <string>
+#include <esp_heap_caps.h>
 
 // dbm → esp_power_level_t 변환 (ESP_PLATFORM에서만 setPower(enum) 오버로드 사용)
 // NimBLE-Arduino 1.4.2: ESP_PWR_LVL_N12(0) ~ ESP_PWR_LVL_P9(7)
@@ -600,6 +601,9 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
 void BitchatRelay::enqueue_packet(const uint8_t* data, size_t len,
                                    BitchatPktSource src, uint16_t conn_id) {
     if (!data || len == 0 || len > BITCHAT_MAX_PKT_LEN) return;
+    // v39b: BLE 패킷은 내부 RAM만 사용 (PSRAM 할당 시 힙 손상 발생)
+    //   NimBLE 콜백 컨텍스트에서 PSRAM 접근 → 캐시 일관성 문제 → 힙 메타데이터 손상
+    //   패킷 크기는 최대 744B로 내부 RAM으로 충분
     uint8_t* buf = (uint8_t*)malloc(len);
     if (!buf) {
         LOGW("malloc failed (%uB), dropping packet", (unsigned)len);

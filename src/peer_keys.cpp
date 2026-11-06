@@ -25,6 +25,7 @@
 #include <SPIFFS.h>
 #include <nvs.h>
 #include <nvs_flash.h>
+#include <esp_heap_caps.h>
 #include <string.h>
 
 // 구버전 호환 - NVS에서 마이그레이션 시 사용
@@ -139,8 +140,11 @@ bool peer_keys_init(void) {
 
     // Heap에서 g_entries 동적 할당 (정적 .bss 부담 피하기)
     // - 128 entries × 74B = 9,472B
-    // - calloc이 0으로 초기화하므로 모든 entry가 inactive 상태로 시작
+    // - v37: S3에서는 PSRAM에서 할당 (heap_caps_calloc with SPIRAM cap)
+    //   C3/ESP32: PSRAM 없음 → 일반 calloc (내부 RAM)
     if (!g_entries) {
+        // v39e: peer_keys는 내부 RAM으로 복귀 (v38b 안정 설정)
+        //   PSRAM 할당 시 heap 단편화 → cert gen 크래시 유발
         g_entries = (peer_key_entry_t*)calloc(BC_PEER_KEY_MAX_ENTRIES,
                                               sizeof(peer_key_entry_t));
         if (!g_entries) {
@@ -150,8 +154,7 @@ bool peer_keys_init(void) {
             return false;
         }
         LOGI("peer_keys: allocated %uB heap for %u entries",
-             (unsigned)(BC_PEER_KEY_MAX_ENTRIES * sizeof(peer_key_entry_t)),
-             BC_PEER_KEY_MAX_ENTRIES);
+             (unsigned)G_ENTRIES_BYTES, BC_PEER_KEY_MAX_ENTRIES);
     }
 
     // SPIFFS 마운트는 main.cpp setup()에서 선행됨
