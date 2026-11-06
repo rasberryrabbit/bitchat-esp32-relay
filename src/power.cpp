@@ -96,10 +96,11 @@ bool power_init(const power_config_t* cfg) {
     pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(BC_POWER_IS_S3)
+    // v36: S3 DFS도 max=min=160 고정 (0x0106 에러 제거, C3과 동일 방식)
     esp_pm_config_esp32s3_t pm_cfg;
     memset(&pm_cfg, 0, sizeof(pm_cfg));
-    pm_cfg.max_freq_mhz       = 160;     // v29: S3 최대 160MHz (발열 감소, 240→160)
-    pm_cfg.min_freq_mhz       = 80;      // S3 최저 80MHz (DFS 유휴 시)
+    pm_cfg.max_freq_mhz       = 160;     // S3 고정 160MHz
+    pm_cfg.min_freq_mhz       = 160;     // v36: 80→160 (DFS 비활성, 에러 방지)
     pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)

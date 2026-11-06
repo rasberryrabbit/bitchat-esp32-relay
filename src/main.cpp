@@ -850,22 +850,33 @@ static void handle_cert_command(char* args) {
             }
         }
 
-        // 16KB 스택 태스크에서 cert gen 실행
-        BaseType_t tc = xTaskCreate(
+        // v36: cert gen 태스크 개선 (S3 리셋 문제 해결)
+        //   - core 0에서 실행 (mbedTLS는 core 0에 최적화, core 1은 불안정)
+        //   - 스택 48KB (32KB→48KB, RSA 2048 + X509 안전 마진)
+        //   - WDT 30초로 연장 (RSA 생성 10-20초, 5초 WDT 타임아웃 방지)
+        //   - 우선순위 1 (BLE/WiFi 우선 처리)
+        BaseType_t tc = xTaskCreatePinnedToCore(
             [](void* param) {
                 const char* cn = (const char*)param;
+                // v36: WDT 30초로 연장, 패닉 비활성 (RSA 생성 중 안전)
+                esp_task_wdt_init(30, false);
+                LOGI("cert gen: free heap=%uB, stack task created",
+                     (unsigned)ESP.getFreeHeap());
                 if (cert_generate_self_signed(cn)) {
                     LOGI("cert gen: auto-enabling TLS (net tls on)");
                     wifi_bridge_set_tls_enabled(true);
                 }
+                // WDT 정상 설정으로 복귀
+                esp_task_wdt_init(5, true);
                 if (param) free(param);
                 vTaskDelete(nullptr);
             },
             "certgen",     // 태스크명
-            16384,         // 스택 16KB (loopTask 8KB의 2배)
+            49152,         // v36: 스택 48KB (32KB→48KB)
             cn_copy,       // CN 문자열
-            5,             // 우선순위
-            nullptr        // 핸들 불필요
+            1,             // 우선순위 1 (BLE/WiFi 우선)
+            nullptr,       // 핸들 불필요
+            0              // v36: core 0 고정 (mbedTLS 안정성)
         );
         if (tc != pdPASS) {
             LOGE("cert gen: failed to create task (heap exhausted?)");
@@ -1026,12 +1037,12 @@ void setup() {
 #endif
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v34 (thermal-mgmt: auto BLE/WiFi power control)");
+    Serial.println(" v36b (S3-DFS-fix + cert-gen-48KB-core0-WDT30)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
-    Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
+    Serial.println(" target: ESP32-C3 Super Mini (RISC-V, BLE 5.0, USB CDC)");
 #elif defined(BOARD_VARIANT_ESP32S3)
-    Serial.println(" target: ESP32-S3 (Xtensa LX7, BLE 5.0 + USB-OTG)");
+    Serial.println(" target: ESP32-S3 Super Mini (FH4R2: 4MB Flash + 2MB PSRAM, USB CDC)");
 #elif defined(BOARD_VARIANT_ESP32)
     Serial.println(" target: ESP32 classic (Xtensa LX6, BLE 4.2)");
 #else
