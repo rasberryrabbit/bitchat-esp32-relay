@@ -10,6 +10,17 @@
 #   - 기본 BLE 스텍은 NimBLE (더 적은 메모리)이지만,
 #     Arduino BLE 라이브러리 호환을 위해 Bluedroid 강제 사용
 
+# ==== v27 결정적 플래시 설정 (C3 Super Mini 4MB) ====
+# bootloader.bin 헤더가 정확히 4MB/40MHz/DIO로 박히도록 강제
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# ==== v27 USB CDC (C3 Super Mini native USB) ====
+# seeed_xiao_esp32c3 보드는 USB CDC가 내장이지만 sdkconfig에서도 활성화
+CONFIG_TINYUSB_CDC_ENABLED=y
+
 # ---- CPU/클럭 ----
 CONFIG_ESP32C3_DEFAULT_CPU_FREQ_160=y
 CONFIG_ESP32C3_DEFAULT_CPU_FREQ_MHZ=160
@@ -53,16 +64,18 @@ CONFIG_PARTITION_TABLE_DEFAULT=y
 # ---- Arduino 컴포넌트 ----
 CONFIG_AUTOSTART_ARDUINO=y
 
-# ---- 전원 관리 (배터리+절전 모드) - C3 특화 ----
-# C3는 단일 코어 RISC-V, esp_pm_configure에 다른 config struct 사용
+# ---- v29: 절전 관리 - DFS만 활성화 (light_sleep는 BLE 비호환으로 끔) ----
+# v28에서 PM을 완전히 끄니 발열 심해짐 → v29: DFS 재활성화로 CPU 클럭 자동 강하
+# CONFIG_PM_ENABLE=y + light_sleep_enable=false → 유휴 시 80→40MHz 자동 강하
 CONFIG_PM_ENABLE=y
 CONFIG_PM_DFS_INIT_AUTO=y
-CONFIG_PM_POWER_DOWN_CPU=y
-# FreeRTOS tickless idle - CPU 유휴 시 자동 라이트 슬립
-CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
-CONFIG_FREERTOS_TICKLESS_IDLE_TIME=1
-CONFIG_FREERTOS_USE_RTC_HWOPTS=y
+CONFIG_PM_POWER_DOWN_CPU=n
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=n
+CONFIG_FREERTOS_USE_RTC_HWOPTS=n
 CONFIG_UART_ISR_IN_IRAM=y
+# 브라운아웃 감지 활성 (전압 강하 시 안전 리셋)
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL=7
 
 # ---- 메모리 절약 (C3 특화) ----
 # BT 컨트롤러 메모리 최적화

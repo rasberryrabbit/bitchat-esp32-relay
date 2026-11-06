@@ -45,22 +45,31 @@ extern "C" {
 //   - TTGO T-Beam V1:  GPIO 0xFF (AXP192 PMU 경유, 직접 GPIO 제어 불가)
 #ifndef BC_LED_PIN
 #  ifdef BOARD_VARIANT_ESP32C3
-#    define BC_LED_PIN          8       // ESP32-C3-DevKitM-1 온보드 LED
+#    define BC_LED_PIN          8       // ESP32-C3 Super Mini / DevKitM-1 온보드 LED
 #  elif defined(BOARD_VARIANT_ESP32S3)
-#    define BC_LED_PIN          5       // ESP32-S3 외부 LED (GPIO 5)
+#    define BC_LED_PIN          48      // ESP32-S3 Super Mini 온보드 LED (GPIO 48)
 #  else
 #    define BC_LED_PIN          2       // ESP32 DevKitC V4 온보드 LED
 #  endif
 #endif
 
-// 배터리 ADC 설정 (GPIO 35 = ADC1_CH7, 전압 분배 2:1)
-//   LiPo 4.2V → ADC 2.1V → 11dB attenuation으로 측정 가능
+// 배터리 ADC 설정 (전압 분배 2:1 회로 필요: LiPo 4.2V → ADC 2.1V)
 //   - platformio.ini에서 -DBC_BATTERY_ADC_PIN=<n> 으로 override 가능
 //   - 0xFF(=255) = ADC 비활성 (배터리 측정 안 함)
 //   - T-Beam V1.x는 AXP192 PMU (I2C addr 0x34)로 배터리 읽기 때문에 GPIO ADC 불가
 //   - Heltec V2는 GPIO 13 (ADC2_CH4) 사용하지만 WiFi 켜지면 ADC2 동작 안 함
+//   - v30: 사용자 지정 핀
+//     C3 Super Mini: GPIO0 (ADC1_CH0) — 외부 전압 분배 회로 필요
+//     S3 Super Mini: GPIO4 (ADC1_CH3) — 외부 전압 분배 회로 필요
+//     ESP32 클래식: GPIO35 (ADC1_CH7) — DevKitC에 전압 분배 내장
 #ifndef BC_BATTERY_ADC_PIN
-#  define BC_BATTERY_ADC_PIN   35
+#  ifdef BOARD_VARIANT_ESP32C3
+#    define BC_BATTERY_ADC_PIN   0       // C3 Super Mini: GPIO0 (ADC1_CH0)
+#  elif defined(BOARD_VARIANT_ESP32S3)
+#    define BC_BATTERY_ADC_PIN   4       // S3 Super Mini: GPIO4 (ADC1_CH3)
+#  else
+#    define BC_BATTERY_ADC_PIN   35      // ESP32 클래식: ADC1_CH7
+#  endif
 #endif
 #define BC_BATTERY_DIVIDER_R1 100000.0f  // 100kΩ (배터리 측)
 #define BC_BATTERY_DIVIDER_R2 100000.0f  // 100kΩ (GND 측)

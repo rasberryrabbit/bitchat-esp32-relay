@@ -338,15 +338,15 @@ static int8_t clamp_tx_power(int8_t dbm) {
 int8_t storage_get_tx_power(void) {
     nvs_handle_t h;
     if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
-        return 9;  // NVS 열기 실패 시 기본값 +9 dBm
+        return 0;  // v32: 기본값 0 dBm (발열 감소, +9→0)
     }
-    int8_t val = 9;  // 기본값
+    int8_t val = 0;  // v32: 기본값 0 dBm
     // int8_t를 uint8_t로 저장했으므로 uint8_t로 읽어서 캐스팅
-    uint8_t raw = 9;
+    uint8_t raw = 0;  // v32: 기본값 0 dBm
     esp_err_t err = nvs_get_u8(h, BC_NVS_KEY_TXPWR, &raw);
     nvs_close(h);
     if (err != ESP_OK) {
-        return 9;  // 키 없으면 기본값
+        return 0;  // v32: 기본값 0 dBm
     }
     val = (int8_t)raw;
     return clamp_tx_power(val);
@@ -373,6 +373,41 @@ bool storage_set_tx_power(int8_t dbm) {
     extern void ble_apply_tx_power(int8_t dbm);
     ble_apply_tx_power(dbm);
     LOGI("tx_power=%+ddBm (persisted)", (int)dbm);
+    return true;
+}
+
+// ----- v34: 온도 임계값 (NVS 영속화) -----
+
+uint8_t storage_get_temp_threshold(void) {
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 65;  // 기본값 65°C
+    }
+    uint8_t val = 65;
+    esp_err_t err = nvs_get_u8(h, BC_NVS_KEY_TMP_THR, &val);
+    nvs_close(h);
+    if (err != ESP_OK) return 65;  // 키 없으면 기본값
+    if (val < 50) val = 50;   // 최소 50°C
+    if (val > 85) val = 85;   // 최대 85°C
+    return val;
+}
+
+bool storage_set_temp_threshold(uint8_t celsius) {
+    if (celsius < 50) celsius = 50;
+    if (celsius > 85) celsius = 85;
+    nvs_handle_t h;
+    if (nvs_open(BC_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        LOGE("storage: NVS open failed for temp_threshold");
+        return false;
+    }
+    esp_err_t err = nvs_set_u8(h, BC_NVS_KEY_TMP_THR, celsius);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        LOGE("storage: NVS set temp_threshold failed");
+        return false;
+    }
+    LOGI("temp_threshold=%u°C (persisted)", celsius);
     return true;
 }
 

@@ -12,9 +12,13 @@
 
 #include "power.h"
 #include "log.h"
-#include "storage.h"   // storage_get_battery_ignore() for battery-ignore flag
+#include "storage.h"   // storage_get_battery_ignore(), storage_get_temp_threshold()
+#include "ble_relay.h" // v34: ble_relay_set_thermal_mode()
+#include "wifi_bridge.h" // v34: wifi_bridge_is_enabled(), wifi_bridge_disconnect()
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 #include <esp_pm.h>
 #include <esp_sleep.h>
 #include <esp32-hal-adc.h>
@@ -72,46 +76,60 @@ bool power_init(const power_config_t* cfg) {
     if (!cfg) return false;
     memcpy(&g_cfg, cfg, sizeof(g_cfg));
 
+    // ----- v29: DFS (Dynamic Frequency Scaling) 항상 적용 -----
+    // 배터리/USB 모드 관계없이 DFS를 켜서 CPU 유휴 시 클럭 자동 강하 → 발열 감소
+    // light_sleep는 BLE와 호환 안 됨(0x0106) → DFS만 켜고 light_sleep는 끔
     if (!g_cfg.battery_mode) {
-        // USB 상시 전원 모드 - 절전 기능 끔, PM 설정 생략
-        LOGI("power: USB always-on mode, power management disabled");
-        g_init_done = true;
-        return true;
+        LOGI("power: USB always-on mode (DFS enabled, light sleep disabled)");
+    } else {
+        LOGI("power: battery mode (DFS enabled, light sleep disabled)");
     }
 
-    // ----- 배터리 모드: ESP-PM 자동 라이트 슬립 설정 -----
-    // ESP32 클래식: esp_pm_config_esp32_t 사용
-    // ESP32-C3: esp_pm_config_esp32c3_t 사용
-    // ESP32-S3: esp_pm_config_esp32s3_t 사용
 #ifdef BC_POWER_IS_C3
+    // v31: C3의 유효 DFS 주파수는 80/160MHz만. 40MHz는 무효 → 0x0106 에러 원인.
+    // max=80, min=80 → CPU 항상 80MHz 고정 (DFS 효과 없지만 에러 없음)
+    // 발열은 f_cpu=80MHz + BLE 주기 느리게로 충분히 감소
     esp_pm_config_esp32c3_t pm_cfg;
     memset(&pm_cfg, 0, sizeof(pm_cfg));
-    pm_cfg.max_freq_mhz       = 160;     // C3 최대 클럭
-    pm_cfg.min_freq_mhz       = 40;       // C3 최저 클럭
-    pm_cfg.light_sleep_enable = true;
+    pm_cfg.max_freq_mhz       = 80;      // C3 최대 80MHz
+    pm_cfg.min_freq_mhz       = 80;      // v31: 40→80 (40MHz는 C3 무효 주파수)
+    pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(BC_POWER_IS_S3)
     esp_pm_config_esp32s3_t pm_cfg;
     memset(&pm_cfg, 0, sizeof(pm_cfg));
-    pm_cfg.max_freq_mhz       = 240;     // S3 최대 클럭
-    pm_cfg.min_freq_mhz       = 80;       // S3 최저 클럭
-    pm_cfg.light_sleep_enable = true;
+    pm_cfg.max_freq_mhz       = 160;     // v29: S3 최대 160MHz (발열 감소, 240→160)
+    pm_cfg.min_freq_mhz       = 80;      // S3 최저 80MHz (DFS 유휴 시)
+    pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
-    // S2는 별도 config struct (참고용)
     rc = ESP_OK;
 #else
     esp_pm_config_esp32_t pm_cfg;
     memset(&pm_cfg, 0, sizeof(pm_cfg));
     pm_cfg.max_freq_mhz       = 240;     // ESP32 클래식 최대
     pm_cfg.min_freq_mhz       = 80;
-    pm_cfg.light_sleep_enable = true;
+    pm_cfg.light_sleep_enable = false;   // v29: light sleep 비활성 (BLE 호환성)
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #endif
     if (rc != ESP_OK) {
-        LOGW("esp_pm_configure failed: 0x%04x (continuing without auto power saving)", rc);
+        LOGW("esp_pm_configure failed: 0x%04x (continuing without DFS)", rc);
     } else {
-        LOGI("power: PM configured (light sleep, DFS enabled)");
+        LOGI("power: DFS configured (max=%d→min=%d MHz, light sleep off)",
+#ifdef BC_POWER_IS_C3
+             80, 40
+#elif defined(BC_POWER_IS_S3)
+             160, 80
+#else
+             240, 80
+#endif
+        );
+    }
+
+    // USB 상시 모드는 여기서 리턴 (배터리 전용 기능 스킵)
+    if (!g_cfg.battery_mode) {
+        g_init_done = true;
+        return true;
     }
 
     // ----- 상태 LED 핀 -----
@@ -146,10 +164,54 @@ bool power_init(const power_config_t* cfg) {
     return true;
 }
 
+// v34: 온도 기반 스마트 전력 제어
+//   10초마다 칩 내부 온도를 읽어 4단계 열 구간 판정 → BLE/WiFi 전력 동적 조정
+static uint32_t g_last_temp_check_ms = 0;
+static float g_last_temp_c = 0.0f;
+static bool g_thermal_monitor_enabled = true;  // 기본 ON
+
+// 온도 구간 판정 → thermal_mode 반환 (0-3)
+static uint8_t temp_to_thermal_mode(float temp_c, uint8_t threshold) {
+    // 히스테리시스: 임계 - 5°C에서 복귀 (급격한 토글 방지)
+    if (temp_c >= threshold + 10) return 3;       // CRITICAL: 임계+10°C
+    if (temp_c >= threshold + 5)  return 2;       // HOT: 임계+5°C
+    if (temp_c >= threshold)      return 1;       // WARM: 임계 도달
+    if (temp_c >= threshold - 5)  return 0;       // COOL 복귀 (히스테리시스)
+    return 0;
+}
+
 void power_handle_idle(void) {
-    if (!g_init_done || !g_cfg.battery_mode) return;
+    if (!g_init_done) return;
 
     uint32_t now = millis();
+
+    // v34: 온도 모니터링 (10초마다, 모든 모드에서 실행)
+    if (g_thermal_monitor_enabled && (now - g_last_temp_check_ms > 10000)) {
+        g_last_temp_check_ms = now;
+        g_last_temp_c = temperatureRead();
+
+        uint8_t threshold = storage_get_temp_threshold();
+        uint8_t new_mode = temp_to_thermal_mode(g_last_temp_c, threshold);
+        uint8_t cur_mode = ble_relay_get_thermal_mode();
+
+        // 모드 변경 시에만 로그 + BLE 파라미터 조정
+        if (new_mode != cur_mode) {
+            LOGI("thermal: %.1f°C → mode %u (threshold=%u°C, hysteresis=%u°C)",
+                 g_last_temp_c, new_mode, threshold, threshold - 5);
+            ble_relay_set_thermal_mode(new_mode);
+
+            // CRITICAL 모드에서 WiFi 강제 OFF
+            if (new_mode >= 2 && wifi_bridge_is_enabled()) {
+                LOGW("thermal: HOT/CRITICAL → WiFi forced OFF");
+                wifi_bridge_disconnect();
+                WiFi.mode(WIFI_OFF);
+                esp_wifi_stop();
+            }
+        }
+    }
+
+    if (!g_cfg.battery_mode) return;  // USB 모드는 여기까지 (딥슬립 로직 스킵)
+
     uint32_t idle_ms = now - g_last_active_ms;
 
     // 5분 이상 무활동 시 딥슬립 진입 (deep_sleep_enabled 플래그가 ON일 때만)

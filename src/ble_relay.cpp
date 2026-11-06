@@ -45,6 +45,71 @@ void ble_apply_tx_power(int8_t dbm) {
 
 BitchatRelay g_relay;
 
+// v34: 온도 기반 스마트 전력 제어
+//   4단계 열 구간별 BLE 파라미터 동적 조정
+static uint8_t g_thermal_mode = 0;  // 0=COOL, 1=WARM, 2=HOT, 3=CRITICAL
+
+// 각 모드별 파라미터 (NimBLE advertising interval = 0.625ms 단위)
+struct thermal_params_t {
+    uint16_t adv_min;    // 광고 최소 간격 (0.625ms 단위)
+    uint16_t adv_max;    // 광고 최대 간격
+    uint16_t scan_int;   // 스캔 주기 (ms)
+    uint16_t scan_win;   // 스캔 윈도우 (ms)
+    bool scan_enable;    // 스캔 활성 여부
+    const char* name;
+};
+
+static const thermal_params_t kThermalParams[] = {
+    // COOL: 정상 (광고 500-1000ms, 스캔 2048ms/15ms)
+    { 0x320, 0x640, 2048, 15, true,  "COOL" },
+    // WARM: 감속 (광고 1000-2000ms, 스캔 4096ms/15ms)
+    { 0x640, 0xC80, 4096, 15, true,  "WARM" },
+    // HOT: 최소 (광고 2000-4000ms, 스캔 8192ms/15ms)
+    { 0xC80, 0x1900, 8192, 15, true, "HOT" },
+    // CRITICAL: 비상 (광고만 5000ms, 스캔 중지)
+    { 0x1F40, 0x1F40, 0, 0, false, "CRITICAL" },
+};
+
+void ble_relay_set_thermal_mode(uint8_t mode) {
+    if (mode > 3) mode = 3;
+    if (mode == g_thermal_mode) return;  // 변경 없음
+
+    uint8_t old = g_thermal_mode;
+    g_thermal_mode = mode;
+    const thermal_params_t* p = &kThermalParams[mode];
+
+    LOGI("thermal: %s→%s (adv %u-%ums, scan %ums/%u%s)",
+         kThermalParams[old].name, p->name,
+         (unsigned)(p->adv_min * 0.625), (unsigned)(p->adv_max * 0.625),
+         (unsigned)p->scan_int, (unsigned)p->scan_win,
+         p->scan_enable ? "" : " OFF");
+
+    // 광고 파라미터 변경 (stop → set → start)
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    if (adv) {
+        adv->stop();
+        adv->setMinPreferred(p->adv_min);
+        adv->setMaxPreferred(p->adv_max);
+        adv->start();
+    }
+
+    // 스캔 파라미터 변경
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    if (scan) {
+        scan->stop();
+        if (p->scan_enable) {
+            scan->setInterval(p->scan_int);
+            scan->setWindow(p->scan_win);
+            scan->setActiveScan(false);
+            scan->start(0, nullptr);  // 연속 스캔
+        }
+    }
+}
+
+uint8_t ble_relay_get_thermal_mode(void) {
+    return g_thermal_mode;
+}
+
 // ============================================================================
 // Server callbacks (incoming connections)
 // ============================================================================
@@ -461,10 +526,11 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     //   - 광고 패킷(31B)에 UUID(18B) + "bitchat"(9B) + flags(3B) = 30B ≤ 31B
     //   - 닉네임이 있으면 "bitchat-<nick>"가 되어 31B 초과 → 광고 실패
     //   - 닉네임은 SPIFFS(/node.conf)에 저장, Serial(node)에서만 표시
-    // v17: TX power를 NVS에서 로드하여 init 전에 설정 (발견 확률 조절)
+    // v28: TX power는 init() 이후에 설정해야 함 (이전에 호출하면 rc=-1 발생)
+    //   NimBLEDevice::setPower() → esp_ble_tx_power_set() 는 컨트롤러 초기화 후에만 동작
     int8_t txpwr = storage_get_tx_power();
-    NimBLEDevice::setPower(dbm_to_pwr_level(txpwr));
     NimBLEDevice::init("bitchat");
+    NimBLEDevice::setPower(dbm_to_pwr_level(txpwr));
     NimBLEDevice::setMTU(247);  // NimBLE 기본 MTU 247 (Bluedroid 517과 다름)
     // NimBLE는 setMTU만으로 client와 server 모두에 적용됨
     LOGI("BLE TX power: %+ddBm", (int)txpwr);
@@ -494,20 +560,13 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     _advertising = NimBLEDevice::getAdvertising();
     _advertising->addServiceUUID(BC_BLE_SERVICE_UUID);
     _advertising->setScanResponse(true);
-#ifdef BC_POWER_BATTERY
-    // v11: 발견 우선 (battery mode라도 연결 전에는 광고를 빠르게 송출)
-    //   setMinPreferred/setMaxPreferred = advertising interval, 0.625ms 단위
-    //   0x20 = 32  * 0.625ms = 20ms   (Apple 권장 최소)
-    //   0x50 = 80  * 0.625ms = 50ms   (Android/iOS 백그라운드 모두 빠른 발견)
-    //   폰이 연결되면 onConnect 이후 광고는 자동 정지(연결 중에는 advertising 불필요),
-    //   onDisconnect에서 재시작 → 실제 광고 송출 시간 = 미연결 유휴 시간뿐.
-    _advertising->setMinPreferred(0x20);
-    _advertising->setMaxPreferred(0x50);
-    // LOGI("BLE advertising: fast 20-50ms (battery mode, discovery-priority, NimBLE)");  // v17: 로그 최소화
-#else
-    _advertising->setMinPreferred(0x06);
-    _advertising->setMaxPreferred(0x12);
-#endif
+    // v32: 발열 감소를 위해 BLE 광고 주기를 더 느리게 조정
+    //   v29: 100-200ms → v32: 500-1000ms (라디오 TX 활동 1/5 추가 감소)
+    //   0x320 = 800 * 0.625ms = 500ms
+    //   0x640 = 1600 * 0.625ms = 1000ms
+    //   폰 앱이 1초 이내에 릴레이 발견 가능 (실용성 유지)
+    _advertising->setMinPreferred(0x320);   // 500ms
+    _advertising->setMaxPreferred(0x640);   // 1000ms
     _advertising->start();
     // v11: 부팅 직후 advertising이 실제로 active인지 진단
     //    NimBLE는 start()가 실패해도 조용히 넘기는 경우가 있어서 isAdvertising()로 확인.
@@ -519,16 +578,13 @@ bool BitchatRelay::begin(bitchat_storage_t* storage) {
     }
 
     // 3) Scanner - NimBLE는 ms 단위
+    // v32: 발열 감소를 위해 스캔 주기를 더 느리게 조정
+    //   v29: 1024ms/30ms → v32: 2048ms/15ms (듀티 2.9% → 0.7%, 라디오 활동 1/4)
+    //   메시 릴레이 발견은 2초 이내에 가능 → 실용성 유지
     _scan = NimBLEDevice::getScan();
     _scan->setAdvertisedDeviceCallbacks(new BitchatAdvertisedCallbacks(this));
-#ifdef BC_POWER_BATTERY
-    _scan->setInterval(1280);  // 1.28s (ms 단위)
-    _scan->setWindow(30);       // 30ms window
-    // v17: scan interval 로그 제거 (상세 정보 불필요)
-#else
-    _scan->setInterval(80);  // 80ms
-    _scan->setWindow(40);   // 40ms
-#endif
+    _scan->setInterval(2048);  // 2.048s (ms 단위)
+    _scan->setWindow(15);       // 15ms window per interval (0.7% duty)
     _scan->setActiveScan(false);
 
     LOGI("BitchatRelay ready (NimBLE backend). max out=%d in=%d",

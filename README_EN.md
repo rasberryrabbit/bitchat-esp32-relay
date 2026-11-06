@@ -10,6 +10,68 @@ Additional bridges: **LoRa auto-detection** + **WiFi TCP/UDP/MQTT** for BLE↔Lo
 
 ---
 
+## v29 — Heat Reduction + Serial Disconnect Reset Fix
+
+v28 disabled power management entirely, causing overheating on C3 Super Mini. Also, closing the serial monitor triggered a reset via DTR/RTS auto-reboot.
+
+### v29 Fixes:
+
+1. **Serial disconnect reset prevention**:
+   - S3: `Serial.enableReboot(false)` — disables USBCDC DTR/RTS 4-step reset sequence
+   - C3: `monitor_rts=0, monitor_dtr=0` in platformio.ini — prevents PlatformIO monitor from toggling DTR/RTS
+   - Alternative: use `screen /dev/ttyACM0 115200` (no DTR/RTS toggling)
+
+2. **DFS (Dynamic Frequency Scaling) re-enabled**:
+   - `CONFIG_PM_ENABLE=y` + `light_sleep_enable=false`
+   - CPU automatically drops to lower frequency when idle
+   - C3: 80→40MHz, S3: 160→80MHz automatic downscale
+   - `power_init()` now applies DFS in both USB and battery modes
+
+3. **CPU frequency reduced**:
+   - C3: f_cpu 160MHz → **80MHz** (50% reduction, major heat reduction)
+   - S3: DFS max_freq 240→160MHz
+
+4. **BLE timing slowed (heat reduction)**:
+   - Advertising interval: 3.75-11.25ms → **100-200ms** (1/20 of previous)
+   - Scan interval: 80ms/40ms → **1024ms/30ms** (duty 50%→2.9%)
+   - Mesh relay discovery still within 1 second — practical performance retained
+
+---
+
+## v28 — C3 Stability Fix (Reset Loop Resolution)
+
+v27 fixed the flashing problem, but C3 Super Mini kept resetting right after BLE advertising started. Three root causes identified and fixed:
+
+1. **TX power call order**: `NimBLEDevice::setPower()` was called BEFORE `NimBLEDevice::init()` → `esp_ble_tx_power_set: rc=-1`. Fixed by reordering.
+2. **Power management incompatible with BLE**: `esp_pm_configure` returned `ESP_ERR_NOT_SUPPORTED (0x0106)` on C3 with light sleep enabled. Disabled `CONFIG_PM_ENABLE` for C3.
+3. **LoRa scan on invalid GPIOs**: C3 doesn't have GPIO 27/23/26 used by standard LoRa pinouts. Auto-skip LoRa scan on C3 (`-DBC_LORA_FORCE_SCAN=1` to override).
+
+Additional: C3/S3 envs now use `BC_POWER_USB_ALWAYS=1` (USB always-on mode) since Super Mini boards are USB-powered. Battery ADC disabled on C3/S3 (GPIO 35 doesn't exist on C3).
+
+---
+
+## v27 — Definitive Flashing Fix for C3/S3 Super Mini
+
+**Root cause of v26 flashing failures**: `bootloader.bin` was built with 1MB/26MHz flash settings even though `firmware.bin` was correctly 4MB/40MHz. The board JSON's `f_flash`/`flash_mode` only affect the app image; the bootloader follows `sdkconfig`'s `CONFIG_ESPTOOLPY_*` settings, which were missing.
+
+**v27 fix**: Added `CONFIG_ESPTOOLPY_FLASHMODE_DIO=y` / `FLASHFREQ_40M=y` / `FLASHSIZE_4MB=y` to `sdkconfig.defaults` and per-target files. Now `bootloader.bin` is baked with 4MB/40MHz/DIO at build time → no runtime header patching, no SHA mismatch.
+
+Verify your build:
+```bash
+python3 tools/verify_headers.py
+# All boards should show: DIO / 4MB / 40MHz (byte2=0x02, byte3=0x20)
+```
+
+Flash your board:
+```bash
+python3 tools/flash_bitchat.py --board esp32c3 --port /dev/ttyACM0
+python3 tools/flash_bitchat.py --board esp32s3 --port /dev/ttyACM0
+```
+
+See `README-flash-english.txt` for full flashing guide and troubleshooting.
+
+---
+
 ## Supported Boards
 
 | | ESP32 Classic | ESP32-C3 | ESP32-S3 |

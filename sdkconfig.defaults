@@ -3,6 +3,19 @@
 # 이 파일은 `idf.py set-target esp32` 후 sdkconfig에 병합됨.
 # 사용자가 sdkconfig를 직접 수정하지 않아도 이 기본값들이 적용됨.
 
+# ==== v27 결정적 플래시 설정 (모든 보드 공통) ====
+# 이 설정이 빠지면 bootloader.bin 헤더가 1MB/26MHz로 잘못 생성되어
+# C3/S3 Super Mini(4MB Flash)에서 부팅 실패/SHA mismatch 발생.
+# board JSON의 f_flash/flash_mode는 firmware(app) 이미지에만 적용되고
+# bootloader는 sdkconfig의 CONFIG_ESPTOOLPY_* 설정을 따르기 때문에
+# 반드시 sdkconfig.defaults에 명시해야 함.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+# bootloader가 자신의 헤더를 덮어쓰지 않도록 (build-time에 헤더 확정)
+CONFIG_ESPTOOLPY_AFTER_FLASH_NO_RESET=n
+
 # ---- BLE - NimBLE 사용 (Bluedroid 비활성) ----
 # NimBLE-Arduino 라이브러리가 자체 NimBLE 스텍 포함하므로
 # ESP-IDF Bluedroid는 비활성화하여 메모리 절약

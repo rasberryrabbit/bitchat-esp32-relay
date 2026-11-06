@@ -10,6 +10,40 @@
 
 ---
 
+## v28 — C3 안정성 수정 (리셋 루프 해결)
+
+v27에서 플래싱 문제는 해결되었으나 C3 Super Mini에서 부팅 후 BLE advertising 시작 직후 리셋 반복 현상 발생. 세 가지 근본 원인 발견 및 수정:
+
+1. **TX 파워 호출 순서**: `NimBLEDevice::setPower()`가 `NimBLEDevice::init()` **이전에** 호출되어 `esp_ble_tx_power_set: rc=-1` 발생. 호출 순서 변경으로 해결.
+2. **절전 관리 BLE 비호환**: `esp_pm_configure`가 C3에서 `ESP_ERR_NOT_SUPPORTED (0x0106)` 반환 (light sleep 활성 시). C3용 `CONFIG_PM_ENABLE=n` 설정.
+3. **무효 GPIO LoRa 스캔**: C3는 GPIO 27/23/26이 없음 (표준 LoRa 핀아웃). C3에서 LoRa 스캔 자동 스킵 (`-DBC_LORA_FORCE_SCAN=1`로 강제 가능).
+
+추가: C3/S3 환경 모두 `BC_POWER_USB_ALWAYS=1` (USB 상시 모드) 적용 — Super Mini는 USB 전원 전용. 배터리 ADC도 C3/S3에서 비활성 (GPIO 35가 C3에 없음).
+
+---
+
+## v27 — C3/S3 Super Mini 플래싱 결정적 해결
+
+**v26 실패 원인**: `bootloader.bin`이 1MB/26MHz 설정으로 빌드되었음 (`firmware.bin`은 정상적으로 4MB/40MHz로 생성되었으나 bootloader만 잘못됨). board JSON의 `f_flash`/`flash_mode`는 app 이미지에만 적용되고, bootloader는 sdkconfig의 `CONFIG_ESPTOOLPY_*` 설정을 따르는데 이 것이 누락되었기 때문.
+
+**v27 수정**: `sdkconfig.defaults`와 타겟별 파일에 `CONFIG_ESPTOOLPY_FLASHMODE_DIO=y` / `FLASHFREQ_40M=y` / `FLASHSIZE_4MB=y` 명시. 이제 빌드 타임에 bootloader 헤더가 4MB/40MHz/DIO로 확정 → 런타임 헤더 패치 불필요, SHA mismatch 해결.
+
+빌드 검증:
+```bash
+python3 tools/verify_headers.py
+# 모든 보드: DIO / 4MB / 40MHz (byte2=0x02, byte3=0x20)
+```
+
+플래싱:
+```bash
+python3 tools/flash_bitchat.py --board esp32c3 --port /dev/ttyACM0
+python3 tools/flash_bitchat.py --board esp32s3 --port /dev/ttyACM0
+```
+
+상세 가이드는 `README-flash-korean.txt` 참조.
+
+---
+
 ## 지원 보드
 
 | 항목 | ESP32 클래식 | ESP32-C3 | ESP32-S3 |

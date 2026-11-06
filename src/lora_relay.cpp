@@ -30,6 +30,12 @@
 
 // 자동 감지할 핀아웃 후보들
 static const lora_pinout_t kPinouts[] = {
+    // v30: C3 Super Mini 전용 핀아웃 (사용자 지정)
+    //   외부 LoRa 모듈 연결용 (SX127x 호환)
+    //   SCK=GPIO4, MISO=GPIO5, MOSI=GPIO6, CS=GPIO20, RST=GPIO2, IRQ/DIO0=GPIO1
+    //   DC(GPIO3), BUSY(GPIO1) 핀은 SX126x 모듈용 (SX127x에서는 DC 미사용, BUSY=IRQ)
+    //   ★ 외부 전원 회로 필수: LoRa TX 시 100mA+ 소모, C3/S3 3.3V 레귤레이트로는 부족
+    {"C3 Super Mini (ext LoRa)", 4, 5, 6, 20, 2, 1, false},
     // Heltec WiFi LoRa 32 V2, TTGO LoRa32 V1 - 가장 일반적
     {"Heltec/TTGO LoRa32 V1/V2", 5, 19, 27, 18, 14, 26, false},
     // TTGO T-Beam (배터리 내장 버전)
@@ -53,24 +59,53 @@ static uint32_t g_drops_too_large = 0;
 static uint32_t g_drops_parse_fail = 0;
 static uint32_t g_frequency = LORA_FREQ_EU_868;
 
+// v31: C3에서 무효한 GPIO(27, 23, 26 등)를 사용하는 핀아웃을 스킵
+// C3 Super Mini의 유효 GPIO: 0-10, 18-21 (27, 23, 26은 C3에 존재하지 않음)
+// 이 핀들로 SPI.begin() 호출 시 불안정 → 리셋 원인
+static bool is_pinout_valid_for_c3(const lora_pinout_t* p) {
+    // C3 유효 GPIO 범위: 0-10, 18-21
+    auto is_valid_gpio = [](int pin) -> bool {
+        if (pin >= 0 && pin <= 10) return true;
+        if (pin >= 18 && pin <= 21) return true;
+        return false;
+    };
+    return is_valid_gpio(p->sck) && is_valid_gpio(p->miso) &&
+           is_valid_gpio(p->mosi) && is_valid_gpio(p->cs) &&
+           is_valid_gpio(p->rst) && is_valid_gpio(p->irq);
+}
+
 bool lora_relay_begin(uint32_t frequency_hz) {
     g_frequency = frequency_hz;
 
+#if defined(BOARD_VARIANT_ESP32C3)
+    // v31: C3에서는 무효 GPIO 핀아웃 스킵
+    size_t valid_count = 0;
+    for (size_t i = 0; i < NUM_PINOUTS; ++i) {
+        if (is_pinout_valid_for_c3(&kPinouts[i])) valid_count++;
+    }
+    LOGI("lora: scanning for SX127x module (%u/%u pinouts valid for C3)...",
+         (unsigned)valid_count, (unsigned)NUM_PINOUTS);
+#else
     LOGI("lora: scanning for SX127x module (%u pinout candidates)...",
          (unsigned)NUM_PINOUTS);
+#endif
 
     for (size_t i = 0; i < NUM_PINOUTS; ++i) {
         const lora_pinout_t* p = &kPinouts[i];
+
+#if defined(BOARD_VARIANT_ESP32C3)
+        // v31: C3에서 무효 GPIO 핀아웃 스킵
+        if (!is_pinout_valid_for_c3(p)) {
+            LOGD("lora: skipping %s (invalid GPIO for C3)", p->name);
+            continue;
+        }
+#endif
+
         LOGD("lora: trying %s (sck=%d miso=%d mosi=%d cs=%d rst=%d irq=%d)",
              p->name, p->sck, p->miso, p->mosi, p->cs, p->rst, p->irq);
 
         // SPI 핀 설정
-        if (p->uses_spi_begin) {
-            SPI.begin(p->sck, p->miso, p->mosi, p->cs);
-        } else {
-            SPI.begin(p->sck, p->miso, p->mosi, p->cs);
-        }
-
+        SPI.begin(p->sck, p->miso, p->mosi, p->cs);
         LoRa.setPins(p->cs, p->rst, p->irq);
 
         // LoRa 초기화 (1초 타임아웃)

@@ -24,6 +24,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -44,6 +45,9 @@ static bool g_init_done = false;
 static bool g_enabled = false;          // 사용자가 wifi on 했는지
 static bool g_wifi_connected = false;
 static bool g_mqtt_connected = false;
+// v33: WiFi 자동 타임아웃 (5분 비활성 시 WiFi OFF로 발열 감소)
+static uint32_t g_last_wifi_activity_ms = 0;
+#define WIFI_TIMEOUT_MS (5 * 60 * 1000)  // 5분
 static WiFiClient g_wifi_client;             // plain MQTT (1883) + socket client 공용
 static WiFiClientSecure g_wifi_secure;       // mTLS MQTT (8883)
 static PubSubClient g_mqtt_client(g_wifi_client);  // 초기엔 plain, init에서 secure로 교체
@@ -178,6 +182,7 @@ static void sock_stop(void);
 //   v19:  binary payload 직접 → BLE 큐 (CPU/대역폭 33% 절약)
 static void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     LOGD("mqtt RX topic=%s len=%u", topic, length);
+    g_last_wifi_activity_ms = millis();  // v33: 수신 활동 마킹
 
     if (length == 0 || length > BITCHAT_MAX_PKT_LEN) {
         g_decode_fail++;
@@ -304,6 +309,7 @@ bool wifi_bridge_init(void) {
 static bool wifi_connect_open_auto(void) {
     LOGI("wifi: no SSID configured, scanning for open networks...");
     WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_2dBm);  // v33: 발열 감소 (기본 19.5dBm → 2dBm)
     int n = WiFi.scanNetworks(false, false);  // async=false, show_hidden=false
     if (n <= 0) {
         LOGE("wifi: no networks found");
@@ -404,10 +410,12 @@ bool wifi_bridge_begin_connection(const char* ssid, const char* password) {
         }
         g_wifi_connected = true;
         g_enabled = true;
+        g_last_wifi_activity_ms = millis();  // v33: 타임아웃 타이머 시작
     } else {
         // 기존: 지정된 SSID로 연결
         LOGI("wifi: connecting to SSID=%s ...", actual_ssid);
         WiFi.mode(WIFI_STA);
+        WiFi.setTxPower(WIFI_POWER_2dBm);  // v33: 발열 감소 (기본 19.5dBm → 2dBm)
         WiFi.begin(actual_ssid, actual_pass);
 
         // 최대 15초 대기
@@ -431,6 +439,7 @@ bool wifi_bridge_begin_connection(const char* ssid, const char* password) {
         }
         g_wifi_connected = true;
         g_enabled = true;
+        g_last_wifi_activity_ms = millis();  // v33: 타임아웃 타이머 시작
     }
 
     LOGI("wifi: connected! IP=%s, RSSI=%d dBm",
@@ -514,6 +523,20 @@ bool wifi_bridge_is_enabled(void) {
 
 void wifi_bridge_loop(void) {
     if (!g_init_done || !g_wifi_connected) return;
+
+    // v33: WiFi 자동 타임아웃 (5분 비활성 시 WiFi OFF)
+    //   발열 감소: WiFi를 켜둔 채 유휴 시 자동으로 라디오 종료
+    //   'net on' 명령으로 다시 켤 수 있음
+    if (g_last_wifi_activity_ms > 0 &&
+        (millis() - g_last_wifi_activity_ms) > WIFI_TIMEOUT_MS) {
+        LOGI("wifi: 5min idle timeout, turning OFF (heat reduction)");
+        wifi_bridge_disconnect();
+        WiFi.mode(WIFI_OFF);    // WiFi 라디오 완전 종료
+        esp_wifi_stop();        // WiFi 하드웨어 정지
+        g_last_wifi_activity_ms = 0;  // 타이머 리셋
+        return;
+    }
+
     // WiFi가 끊어졌으면 자동 재연결 시도
     if (WiFi.status() != WL_CONNECTED) {
         LOGW("wifi: connection lost, retrying...");
@@ -551,6 +574,9 @@ void wifi_bridge_loop(void) {
 // v19/v20: wifi_bridge_publish - transport mode + proto에 따라 전송
 bool wifi_bridge_publish(const uint8_t* data, size_t len) {
     if (!data || len == 0 || len > BITCHAT_MAX_PKT_LEN) return false;
+
+    // v33: WiFi 활동 마킹 (자동 타임아웃 리셋)
+    g_last_wifi_activity_ms = millis();
 
     if (g_transport_mode == BC_NET_MODE_SOCKET) {
         if (g_net_proto == BC_NET_PROTO_TCP) {
@@ -716,6 +742,7 @@ static void socket_loop(void) {
             int read = sock_read(g_socket_rx_buf, g_socket_rx_len);
             if (read == (int)g_socket_rx_len) {
                 g_packets_rx++;
+                g_last_wifi_activity_ms = millis();  // v33: 수신 활동 마킹
                 g_relay.enqueue_packet(g_socket_rx_buf, g_socket_rx_len,
                                        BC_SRC_CLIENT_NOTIFY, 0xFFFC);
                 LOGD("socket->BLE: enqueued %u bytes", (unsigned)g_socket_rx_len);
@@ -1184,6 +1211,7 @@ static void udp_loop(void) {
             } else {
                 udp_rx_mark(seq);
                 g_packets_rx++;
+                g_last_wifi_activity_ms = millis();  // v33: 수신 활동 마킹
                 g_relay.enqueue_packet(g_socket_rx_buf, payload_len, BC_SRC_CLIENT_NOTIFY, 0xFFFC);
                 LOGD("udp->BLE: enqueued %u bytes (seq=%u)", payload_len, seq);
             }

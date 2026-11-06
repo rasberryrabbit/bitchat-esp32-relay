@@ -31,7 +31,8 @@ extern "C" {
 #define BC_NVS_KEY_BAT_IGN "bat_ign"  // 배터리 상태 무시 플래그 (uint8_t, 0/1)
 #define BC_NVS_KEY_SFF_EN  "sff_en"   // store-and-forward SPIFFS 캐시 enable (uint8_t, 0/1, 기본 1=ON)
 #define BC_NVS_KEY_DS_EN   "dpslp"    // 딥슬립 허용 플래그 (uint8_t, 0/1, 기본 0=OFF)
-#define BC_NVS_KEY_TXPWR   "txpwr"    // BLE TX power (int8_t dBm, 기본 9=+9dBm)
+#define BC_NVS_KEY_TXPWR   "txpwr"    // BLE TX power (int8_t dBm, 기본 0=0dBm)
+#define BC_NVS_KEY_TMP_THR "tmpth"    // v34: 온도 임계값 (uint8_t °C, 기본 65)
 #define BC_NVS_KEY_NETMODE "nmode"    // net transport mode (uint8_t, 0=off 1=socket 2=mqtt, 기본 1)
 #define BC_NVS_KEY_SOCKHOST "shost"   // socket server host (string, 최대 64B)
 #define BC_NVS_KEY_SOCKPORT "sport"   // socket server port (uint16_t, 기본 8765)
@@ -181,8 +182,15 @@ bool storage_set_deep_sleep_enabled(bool enabled);
 //     - 배터리 절약 + 근거리: txpower 0 또는 3
 //     - 극단적 절전: txpower -3
 
-int8_t storage_get_tx_power(void);              // 기본 +9 dBm
+int8_t storage_get_tx_power(void);              // 기본 0 dBm (v32)
 bool storage_set_tx_power(int8_t dbm);          // NVS에 저장 + ble_relay에 즉시 적용
+
+// ----- v34: 온도 임계값 (NVS 영속화) -----
+//   칩 내부 온도가 이 값에 도달하면 절전 모드 진입 (BLE 감속 + WiFi OFF)
+//   기본값: 65°C (Super Mini 보드 권장)
+//   히스테리시스: 임계 - 5°C 복귀
+uint8_t storage_get_temp_threshold(void);      // 기본 65°C
+bool storage_set_temp_threshold(uint8_t celsius);
 
 // ----- v19: net transport mode (NVS 영속화) -----
 //   0=OFF, 1=SOCKET (기본, 직접 TCP), 2=MQTT (브로커)

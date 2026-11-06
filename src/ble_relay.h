@@ -206,3 +206,9 @@ private:
 };
 
 extern BitchatRelay g_relay;
+
+// v34: 온도 기반 스마트 전력 제어 — BLE 파라미터 동적 조정
+//   thermal_mode: 0=COOL(정상), 1=WARM(감속), 2=HOT(최소), 3=CRITICAL(비상)
+//   각 모드별 BLE 광고 주기 + 스캔 주기 + 스캔 윈도우가 자동 조정됨
+void ble_relay_set_thermal_mode(uint8_t thermal_mode);
+uint8_t ble_relay_get_thermal_mode(void);

@@ -14,6 +14,9 @@
 
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <esp_task_wdt.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 #include "log.h"
 #include "crypto.h"
 #include "storage.h"
@@ -90,6 +93,8 @@ static void print_help(void) {
     Serial.println(F("dump            - show packet dump status (default OFF)"));
     Serial.println(F("dump on         - enable RX write + hex dump (RAM only, not persisted)"));
     Serial.println(F("dump off        - disable dump (performance-safe)"));
+    Serial.println(F("temp            - show chip temperature + thermal mode"));
+    Serial.println(F("temp threshold <50-85> - set temp threshold (default 65C, NVS persisted)"));
     Serial.println(F("net mode socket - direct TCP socket (default, no broker)"));
     Serial.println(F("net mode mqtt   - MQTT broker mode (binary, QoS 1)"));
     Serial.println(F("net mode off    - disable internet bridge"));
@@ -456,6 +461,62 @@ static void handle_dump_command(char* args) {
     } else {
         LOGE("usage: dump [on|off]");
     }
+}
+
+// v34: 칩 내부 온도 출력 + 임계값 설정 + 모니터링 제어
+static void handle_temp_command(char* args) {
+    if (!args || *args == 0) {
+        // 현재 온도 + 설정 출력
+        float temp_c = temperatureRead();
+        uint8_t threshold = storage_get_temp_threshold();
+        uint8_t mode = ble_relay_get_thermal_mode();
+        const char* mode_names[] = {"COOL", "WARM", "HOT", "CRITICAL"};
+
+        LOGI("=== chip temperature ===");
+        LOGI("  internal: %.1f°C", temp_c);
+        LOGI("  threshold: %u°C (NVS persisted)", threshold);
+        LOGI("  hysteresis: %u°C (resume normal below)", threshold - 5);
+        LOGI("  thermal mode: %u (%s)", mode, mode_names[mode]);
+        LOGI("  normal range: 30-85°C");
+        LOGI("  warning: >85°C");
+        LOGI("  critical: >105°C (auto-shutdown risk)");
+
+        if (temp_c < 40) {
+            LOGI("  status: COOL (good)");
+        } else if (temp_c < 55) {
+            LOGI("  status: WARM (normal)");
+        } else if (temp_c < 70) {
+            LOGI("  status: HOT (reducing BLE activity)");
+        } else if (temp_c < 85) {
+            LOGW("  status: VERY HOT (minimal BLE, WiFi OFF)");
+        } else {
+            LOGW("  status: CRITICAL! Reduce load or add cooling");
+        }
+
+        if (wifi_bridge_is_enabled()) {
+            LOGI("  WiFi: ON (+5-10°C expected)");
+        } else {
+            LOGI("  WiFi: OFF (BLE-only)");
+        }
+        return;
+    }
+
+    // temp threshold <N>  — 임계 온도 설정 (50-85°C)
+    if (strncmp(args, "threshold ", 10) == 0) {
+        long val = strtol(args + 10, nullptr, 10);
+        if (val < 50 || val > 85) {
+            LOGE("threshold range: 50-85°C (got %ld)", val);
+            return;
+        }
+        if (storage_set_temp_threshold((uint8_t)val)) {
+            LOGI("temp threshold set to %u°C (takes effect on next 10s check)", (uint8_t)val);
+        } else {
+            LOGE("failed to set temp threshold (NVS error)");
+        }
+        return;
+    }
+
+    LOGE("usage: temp [threshold <50-85>]");
 }
 
 // ============================================================
@@ -880,6 +941,8 @@ static void process_serial_input(void) {
                     handle_txpower_command(args);
                 } else if (strcmp(cmd, "dump") == 0) {
                     handle_dump_command(args);
+                } else if (strcmp(cmd, "temp") == 0) {
+                    handle_temp_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {
@@ -940,11 +1003,30 @@ static void process_serial_input(void) {
 void setup() {
     // 시리얼 초기화 - USB serial (디버깅/최초 설정용)
     // 배터리 모드에서도 USB가 연결된 동안은 로그 출력
+    // v26: USB CDC 보드 (C3/S3 Super Mini)에서 CDC 열거 대기
     Serial.begin(115200);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+    // v29: USBCDC (S3 TinyUSB)는 enableReboot(false)로 DTR/RTS 리셋 비활성화
+    //   시리얼 모니터 종료 시 DTR 드롭으로 인한 자동 리셋 방지
+    //   HWCDC (C3 USB Serial/JTAG)는 enableReboot() 메서드가 없어서
+    //   platformio.ini의 monitor_rts=0/monitor_dtr=0로 보조 제어
+#if defined(BOARD_VARIANT_ESP32S3)
+    Serial.enableReboot(false);  // S3: USBCDC DTR/RTS 리셋 비활성
+    Serial.println("USB CDC reboot disabled (S3)");
+#endif
+    // USB CDC는 호스트가 열거할 때까지 대기 필요 (최대 3초)
+    // 없으면 부팅 로그가 호스트가 포트를 열기 전에 출력되어 손실
+    uint32_t usb_start = millis();
+    while (!Serial && (millis() - usb_start < 3000)) {
+        delay(10);
+    }
     delay(100);
+#else
+    delay(100);
+#endif
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v25 (auto cert generation)");
+    Serial.println(" v34 (thermal-mgmt: auto BLE/WiFi power control)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 (RISC-V, BLE 5.0)");
@@ -979,6 +1061,14 @@ void setup() {
         LOGW("power_init failed, continuing without power management");
     }
 
+    // v32: WiFi 라디오 완전 종료 — 발열 대폭 감소
+    //   ESP32-C3/S3는 BLE + WiFi 라디오가 동시 활성 시 발열 심함
+    //   WiFi 브릿지를 사용하지 않을 때는 WiFi 라디오를 완전히 끔
+    //   (사용자가 'net on' 명령 시 WiFi.mode(WIFI_STA)로 다시 켜짐)
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+    LOGI("WiFi radio OFF (BLE-only mode, heat reduction)");
+
     // NVS에서 자체 키 복원 또는 새로 생성
     if (!storage_init(&g_storage)) {
         LOGE("storage_init failed, halting");
@@ -987,16 +1077,19 @@ void setup() {
     storage_debug_dump(&g_storage);
 
     // SPIFFS 마운트 - 블랙리스트 영속화 + 향후 파일 저장 용도
-    //   - partitions/no_ota_spiffs_1mb.csv: spiffs 1024KB @ 0x2F0000
-    //   - true = format if mount fails (첫 플래싱 시 자동 포맷)
+    //   v31: SPIFFS 1280KB 포맷 시 WDT 타임아웃 방지
+    //   - 첫 플래싱 시 1280KB 포맷에 ~8초 소요 → WDT 리셋 발생
+    //   - 해결: 포맷 전 WDT 비활성, 포맷 후 WDT 재활성
+    LOGI("SPIFFS: mounting (format_on_fail=true, 1280KB partition)...");
+    esp_task_wdt_init(30, false);  // WDT 타임아웃 30초로 연장, 패닉 비활성
     if (!SPIFFS.begin(true)) {
         LOGE("SPIFFS mount failed, blacklist/node_config/wifi will be degraded");
     } else {
-        // 사용량 표시 (arduino-esp32 v2.x: totalBytes()/usedBytes())
         LOGI("SPIFFS mounted: used=%u / total=%u bytes",
              (unsigned)SPIFFS.usedBytes(),
              (unsigned)SPIFFS.totalBytes());
     }
+    esp_task_wdt_init(5, true);  // WDT 정상 설정으로 복귀 (5초, 패닉 활성)
 
     // 노드 프로필 + WiFi/MQTT 설정 로드 (/node.conf, /wifi.conf)
     // - SPIFFS 파일 기반, 변경 시에만 write
@@ -1020,6 +1113,8 @@ void setup() {
     LOGI("=== bitchat relay node ready ===");
 
     // LoRa 모듈 자동 감지 (있으면 BLE↔LoRa 브릿지 자동 활성화)
+    // v30: C3 Super Mini 전용 핀아웃 추가 (SCK=4, MISO=5, MOSI=6, CS=20, RST=2, IRQ=1)
+    //   외부 LoRa 모듈 연결 시 자동 감지. 미연결 시 BLE-only 모드로 동작.
     if (lora_relay_begin(LORA_FREQ_KR_921)) {
         LOGI("LoRa bridge ENABLED: %s",
              lora_relay_get_module_name());
