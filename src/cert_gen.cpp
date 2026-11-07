@@ -15,14 +15,15 @@
 #include <SPIFFS.h>
 #include <esp_system.h>  // esp_fill_random
 
-#include <mbedtls/rsa.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/ecp.h>
+#include <mbedtls/ecdsa.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/bignum.h>
 #include <string.h>
 
-#define CERT_KEY_BITS    2048
-#define PEM_BUF_SIZE     4096
+#define CERT_CURVE       MBEDTLS_ECP_DP_SECP256R1  // P-256 (NIST P-256)
+#define PEM_BUF_SIZE     2048   // ECDSA는 PEM이 작음 (RSA 4096→2048 축소)
 
 // v39i: CTR_DRBG 우회 — ESP32 하드웨어 RNG를 직접 사용
 //   mbedtls_ctr_drbg_seed가 S3에서 크래시 → CTR_DRBG 전체 우회
@@ -63,8 +64,8 @@ bool cert_generate_self_signed(const char* cn) {
     snprintf(ca_dn, sizeof(ca_dn), "CN=%s", common_name);
     snprintf(client_dn, sizeof(client_dn), "CN=%s-client", common_name);
 
-    LOGI("cert_gen: generating certs (CN=%s, RSA %d)...", common_name, CERT_KEY_BITS);
-    LOGI("cert_gen: blocks ~10-30s for RSA key gen");
+    LOGI("cert_gen: generating certs (CN=%s, ECDSA P-256)...", common_name);
+    LOGI("cert_gen: ~1-2s for EC key gen (10x faster than RSA)");
 
     mbedtls_pk_context ca_key, client_key;
     mbedtls_x509write_cert ca_crt, cli_crt;
@@ -96,24 +97,22 @@ bool cert_generate_self_signed(const char* cn) {
     ret = mbedtls_mpi_lset(&serial, 1);
     if (ret != 0) { LOGE("cert_gen: serial: -0x%04x", -ret); goto done; }
 
-    // Generate CA key — hw_random 직접 사용 (ctr_drbg 없음)
-    LOGI("cert_gen: heap=%uB — generating CA key...", (unsigned)ESP.getFreeHeap());
-    ret = mbedtls_pk_setup(&ca_key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+    // v41: ECDSA P-256 키 생성 (RSA 대신 — 10배 빠름, 1/8 메모리)
+    LOGI("cert_gen: heap=%uB — generating CA key (ECDSA P-256)...", (unsigned)ESP.getFreeHeap());
+    ret = mbedtls_pk_setup(&ca_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
     if (ret != 0) { LOGE("cert_gen: CA pk_setup: -0x%04x", -ret); goto done; }
-    ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(ca_key),
-                              hw_random, nullptr,
-                              CERT_KEY_BITS, 65537);
-    if (ret != 0) { LOGE("cert_gen: CA rsa_gen: -0x%04x", -ret); goto done; }
+    ret = mbedtls_ecp_gen_key(CERT_CURVE, mbedtls_pk_ec(ca_key),
+                              hw_random, nullptr);
+    if (ret != 0) { LOGE("cert_gen: CA ecp_gen: -0x%04x", -ret); goto done; }
     LOGI("cert_gen: CA key done (heap=%uB)", (unsigned)ESP.getFreeHeap());
 
     // Generate client key
-    LOGI("cert_gen: heap=%uB — generating client key...", (unsigned)ESP.getFreeHeap());
-    ret = mbedtls_pk_setup(&client_key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+    LOGI("cert_gen: heap=%uB — generating client key (ECDSA P-256)...", (unsigned)ESP.getFreeHeap());
+    ret = mbedtls_pk_setup(&client_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
     if (ret != 0) { LOGE("cert_gen: cli pk_setup: -0x%04x", -ret); goto done; }
-    ret = mbedtls_rsa_gen_key(mbedtls_pk_rsa(client_key),
-                              hw_random, nullptr,
-                              CERT_KEY_BITS, 65537);
-    if (ret != 0) { LOGE("cert_gen: cli rsa_gen: -0x%04x", -ret); goto done; }
+    ret = mbedtls_ecp_gen_key(CERT_CURVE, mbedtls_pk_ec(client_key),
+                              hw_random, nullptr);
+    if (ret != 0) { LOGE("cert_gen: cli ecp_gen: -0x%04x", -ret); goto done; }
     LOGI("cert_gen: client key done (heap=%uB)", (unsigned)ESP.getFreeHeap());
 
     // Build CA cert (self-signed)
@@ -135,6 +134,7 @@ bool cert_generate_self_signed(const char* cn) {
     if (ret != 0) { LOGE("cert_gen: CA ski: -0x%04x", -ret); goto done; }
     ret = mbedtls_x509write_crt_set_key_usage(&ca_crt,
         MBEDTLS_X509_KU_DIGITAL_SIGNATURE | MBEDTLS_X509_KU_KEY_CERT_SIGN | MBEDTLS_X509_KU_CRL_SIGN);
+    // v41: ECDSA = digital signature only (no key encipherment like RSA)
     if (ret != 0) { LOGE("cert_gen: CA ku: -0x%04x", -ret); goto done; }
 
     // Write CA PEM — use PEM_BUF_SIZE not sizeof(pem) (which is pointer size=4)
@@ -171,7 +171,7 @@ bool cert_generate_self_signed(const char* cn) {
     ret = mbedtls_x509write_crt_set_subject_key_identifier(&cli_crt);
     if (ret != 0) { LOGE("cert_gen: cli ski: -0x%04x", -ret); goto done; }
     ret = mbedtls_x509write_crt_set_key_usage(&cli_crt,
-        MBEDTLS_X509_KU_DIGITAL_SIGNATURE | MBEDTLS_X509_KU_KEY_ENCIPHERMENT);
+        MBEDTLS_X509_KU_DIGITAL_SIGNATURE);  // v41: ECDSA = signature only
     if (ret != 0) { LOGE("cert_gen: cli ku: -0x%04x", -ret); goto done; }
 
     // Write client cert PEM — reuse same buffer

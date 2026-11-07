@@ -850,8 +850,8 @@ static void handle_cert_command(char* args) {
         // v25: cert gen [cn] - 자체 서명 인증서 자동 생성
         // 별도 FreeRTOS 태스크에서 실행 (mbedTLS가 큰 스택 사용, loopTask 8KB 초과)
         LOGI("cert gen: starting self-signed certificate generation...");
-        LOGI("cert gen: RSA 2048-bit, SHA-256, valid 10 years");
-        LOGI("cert gen: runs in separate task (~30s), BLE continues running");
+        LOGI("cert gen: ECDSA P-256, SHA-256, valid 10 years");
+        LOGI("cert gen: runs in separate task (~5s), BLE continues running");
 
         // CN 문자열 복사 (태스크에 전달)
         char* cn_copy = nullptr;
@@ -1036,7 +1036,7 @@ void setup() {
 #endif
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v40 (2-board-only: C3 + esp32dev, CTR_DRBG-bypass)");
+    Serial.println(" v41 (ECDSA-P256 + CTR_DRBG-bypass + 2-board)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
     Serial.println(" target: ESP32-C3 Super Mini (RISC-V, BLE 5.0, USB CDC)");
