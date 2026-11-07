@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define BC_PEER_KEY_MAX_ENTRIES  128
+#define BC_PEER_KEY_MAX_ENTRIES  256
 #define BC_PEER_KEY_ID_SIZE       8
 #define BC_PEER_KEY_PK_SIZE       32
 
@@ -63,6 +63,9 @@ size_t peer_keys_count(void);
 
 // 전체 삭제 (SPIFFS 파일 제거)
 void peer_keys_clear(void);
+
+// v44: 지연 쓰기 flush — main loop에서 주기적 호출
+void peer_keys_flush(void);
 
 // 디버그 출력
 void peer_keys_debug_dump(void);

@@ -30,12 +30,11 @@
 
 // 자동 감지할 핀아웃 후보들
 static const lora_pinout_t kPinouts[] = {
-    // v30: C3 Super Mini 전용 핀아웃 (사용자 지정)
-    //   외부 LoRa 모듈 연결용 (SX127x 호환)
-    //   SCK=GPIO4, MISO=GPIO5, MOSI=GPIO6, CS=GPIO20, RST=GPIO2, IRQ/DIO0=GPIO1
-    //   DC(GPIO3), BUSY(GPIO1) 핀은 SX126x 모듈용 (SX127x에서는 DC 미사용, BUSY=IRQ)
-    //   ★ 외부 전원 회로 필수: LoRa TX 시 100mA+ 소모, C3/S3 3.3V 레귤레이트로는 부족
+#if defined(BOARD_VARIANT_ESP32C3)
+    // v30: C3 Super Mini 전용 핀아웃 (C3 빌드에서만 컴파일)
+    //   GPIO 20은 C3에만 존재, ESP32 클래식/S3에서는 무효 → hang 방지
     {"C3 Super Mini (ext LoRa)", 4, 5, 6, 20, 2, 1, false},
+#endif
     // Heltec WiFi LoRa 32 V2, TTGO LoRa32 V1 - 가장 일반적
     {"Heltec/TTGO LoRa32 V1/V2", 5, 19, 27, 18, 14, 26, false},
     // TTGO T-Beam (배터리 내장 버전)
@@ -107,6 +106,9 @@ bool lora_relay_begin(uint32_t frequency_hz) {
         // SPI 핀 설정
         SPI.begin(p->sck, p->miso, p->mosi, p->cs);
         LoRa.setPins(p->cs, p->rst, p->irq);
+
+        // v42b: 와치독 리셋 (LoRa.begin이 최대 1초 블로킹, 6개 시도 시 6초 > WDT 5초)
+        vTaskDelay(1);
 
         // LoRa 초기화 (1초 타임아웃)
         if (LoRa.begin(g_frequency) != 1) {

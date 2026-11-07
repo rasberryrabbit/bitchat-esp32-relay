@@ -18,6 +18,7 @@
 #include <esp_heap_caps.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <soc/rtc.h>
 #include "log.h"
 #include "crypto.h"
 #include "storage.h"
@@ -96,7 +97,10 @@ static void print_help(void) {
     Serial.println(F("dump off        - disable dump (performance-safe)"));
     Serial.println(F("temp            - show chip temperature + thermal mode"));
     Serial.println(F("temp threshold <50-85> - set temp threshold (default 65C, NVS persisted)"));
-    Serial.println(F("psram           - show PSRAM + internal RAM usage (S3 only)"));
+    Serial.println(F("psram           - show memory usage"));
+    Serial.println(F("clock           - show CPU frequency + DFS status"));
+    Serial.println(F("clock <MHz>     - set CPU frequency (C3: 80/160, ESP32: 80/160/240)"));
+    Serial.println(F("clock auto      - thermal-based automatic (default)"));
     Serial.println(F("net mode socket - direct TCP socket (default, no broker)"));
     Serial.println(F("net mode mqtt   - MQTT broker mode (binary, QoS 1)"));
     Serial.println(F("net mode off    - disable internet bridge"));
@@ -465,15 +469,60 @@ static void handle_dump_command(char* args) {
     }
 }
 
-// v39f: 메모리 상태 (PSRAM 비활성화 시 단순 출력)
+// v42: 메모리 상태 (간단)
 static void handle_psram_command(char* args) {
     Serial.println("=== memory ===");
     Serial.printf("  min free heap: %u bytes\n", (unsigned)ESP.getMinFreeHeap());
 #if defined(BOARD_HAS_PSRAM) && BOARD_HAS_PSRAM
     Serial.println("  PSRAM: enabled");
 #else
-    Serial.println("  PSRAM: disabled (v39f - mbedTLS stability)");
+    Serial.println("  PSRAM: disabled");
 #endif
+}
+
+// v42: clock 명령 — CPU 클럭 수동 제어 + DFS 상태 표시
+static bool g_clock_auto = true;  // 기본: 온도 기반 자동
+static uint32_t g_manual_clock_mhz = 0;
+
+static void handle_clock_command(char* args) {
+    if (!args || *args == 0) {
+        uint32_t freq = ESP.getCpuFreqMHz();
+        Serial.println("=== clock ===");
+        Serial.printf("  current: %u MHz\n", (unsigned)freq);
+        Serial.printf("  mode: %s\n", g_clock_auto ? "auto (thermal)" : "manual");
+#if defined(BOARD_VARIANT_ESP32C3)
+        Serial.println("  DFS: 160→80 MHz (idle drops to 80)");
+        Serial.println("  available: 80, 160");
+#elif defined(BOARD_VARIANT_ESP32S3)
+        Serial.println("  DFS: skipped (PM disabled)");
+        Serial.println("  available: 80, 160, 240");
+#else
+        Serial.println("  available: 80, 160, 240");
+#endif
+        return;
+    }
+    if (strcmp(args, "auto") == 0) {
+        g_clock_auto = true;
+        g_manual_clock_mhz = 0;
+        LOGI("clock: auto mode (thermal-based DFS)");
+        return;
+    }
+    long mhz = strtol(args, nullptr, 10);
+#if defined(BOARD_VARIANT_ESP32C3)
+    if (mhz != 80 && mhz != 160) {
+        LOGE("clock: C3 supports 80 or 160 MHz only");
+        return;
+    }
+#else
+    if (mhz != 80 && mhz != 160 && mhz != 240) {
+        LOGE("clock: supported values: 80, 160, 240");
+        return;
+    }
+#endif
+    setCpuFrequencyMhz((uint32_t)mhz);
+    g_clock_auto = false;
+    g_manual_clock_mhz = (uint32_t)mhz;
+    LOGI("clock: set to %u MHz (manual)", (unsigned)mhz);
 }
 
 // v34: 칩 내부 온도 출력 + 임계값 설정 + 모니터링 제어
@@ -959,6 +1008,8 @@ static void process_serial_input(void) {
                     handle_temp_command(args);
                 } else if (strcmp(cmd, "psram") == 0 || strcmp(cmd, "mem") == 0) {
                     handle_psram_command(args);
+                } else if (strcmp(cmd, "clock") == 0) {
+                    handle_clock_command(args);
                 } else if (strcmp(cmd, "peer") == 0) {
                     handle_peer_command(args);
                 } else if (strcmp(cmd, "cert") == 0) {
@@ -1036,10 +1087,12 @@ void setup() {
 #endif
     Serial.println("\r\n=============================");
     Serial.println(" bitchat ESP32 relay firmware");
-    Serial.println(" v41 (ECDSA-P256 + CTR_DRBG-bypass + 2-board)");
+    Serial.println(" v44 (mutex + deferred-write + dual-backup)");
     Serial.println(" build: " __DATE__ " " __TIME__);
 #if defined(BOARD_VARIANT_ESP32C3)
-    Serial.println(" target: ESP32-C3 Super Mini (RISC-V, BLE 5.0, USB CDC)");
+    Serial.println(" target: ESP32-C3 Super Mini (RISC-V, BLE 5.0, USB CDC, DFS)");
+#elif defined(BOARD_VARIANT_ESP32S3)
+    Serial.println(" target: ESP32-S3 Super Mini (Xtensa LX7, BLE 5.0, USB CDC, ECDSA)");
 #elif defined(BOARD_VARIANT_ESP32)
     Serial.println(" target: ESP32 classic (Xtensa LX6, BLE 4.2)");
 #else
@@ -1159,6 +1212,9 @@ void loop() {
         splitter_cleanup_timeouts();
         msg_cache_cleanup();   // 12시간 경과 캐시 항목 제거
     }
+
+    // v44: peer_keys 지연 쓰기 flush (BLE 콜백에서 dirty 표시된 경우)
+    peer_keys_flush();
 
     // 전원 관리 - 유휴 시 라이트 슬립 + 상태 LED + 배터리 모니터링
     power_handle_idle();

@@ -40,21 +40,35 @@ typedef struct {
     uint8_t  key_mask;                     // bit 0: pk[0] valid, bit 1: pk[1] valid
 } peer_key_entry_t;
 
-// 128개 × 74B = 9,472B. 정적 .bss에 넣으면 dram0_0_seg overflow 발생.
-// 따라서 heap (calloc)으로 동적 할당 → 정적 세그먼트 부담 0, heap에서 9.5KB 사용.
-// ESP32 heap은 보통 200+KB이므로 충분한 여유.
-//
-// 주의: g_entries가 포인터이므로 sizeof(g_entries) == 4 (포인터 크기).
-// 절대 sizeof(g_entries)를 쓰지 말고 G_ENTRIES_BYTES를 사용할 것!
-static peer_key_entry_t* g_entries = nullptr;  // peer_keys_init()에서 calloc
+// v43: 256개 × 74B = 18,944B. calloc으로 동적 할당.
+// v43: LRU 추적용 last_seen 배열 (RAM 전용, 동적 할당 → .bss 오버플로우 방지)
+// v44: 뮤텍스 + 지연 쓰기 + 이중 쓰기 (.bak 백업)
+static uint32_t* g_last_seen = nullptr;
+static peer_key_entry_t* g_entries = nullptr;
 static bool g_init = false;
+static SemaphoreHandle_t g_mutex = nullptr;      // v44: 동시성 보호
+static volatile bool g_dirty = false;             // v44: 지연 쓰기 플래그
+#define BC_PEER_KEYS_BAK_FILE "/peer_keys.bak"   // v44: 백업 파일
 
-// g_entries 전체 버퍼 크기 (sizeof(g_entries) 대신 사용)
-// sizeof(pointer) == 4 이므로 포인터에 sizeof를 쓰면 치명적 버그 발생
+// g_entries 전체 버퍼 크기
 #define G_ENTRIES_BYTES ((size_t)(BC_PEER_KEY_MAX_ENTRIES * sizeof(peer_key_entry_t)))
 
-// SPIFFS에 전체 매핑 저장 (덮어쓰기)
+// v44: 이중 쓰기 — .bak 먼저, .bin 나중 (전원 차단 시 .bak에서 복구)
 static void persist_to_spiffs(void) {
+    // 1단계: 백업 파일에 쓰기
+    File bak = SPIFFS.open(BC_PEER_KEYS_BAK_FILE, "w");
+    if (bak) {
+        size_t written = bak.write((const uint8_t*)g_entries, G_ENTRIES_BYTES);
+        bak.close();
+        if (written != G_ENTRIES_BYTES) {
+            LOGE("peer_keys: bak write short %u/%u", (unsigned)written, (unsigned)G_ENTRIES_BYTES);
+            return;  // 백업 실패 시 원본 쓰지 않음 (안전)
+        }
+    } else {
+        LOGE("peer_keys: open(%s, w) failed", BC_PEER_KEYS_BAK_FILE);
+        return;
+    }
+    // 2단계: 원본 파일에 쓰기
     File f = SPIFFS.open(BC_PEER_KEYS_FILE, "w");
     if (!f) {
         LOGE("peer_keys: open(%s, w) failed", BC_PEER_KEYS_FILE);
@@ -63,8 +77,7 @@ static void persist_to_spiffs(void) {
     size_t written = f.write((const uint8_t*)g_entries, G_ENTRIES_BYTES);
     f.close();
     if (written != G_ENTRIES_BYTES) {
-        LOGE("peer_keys: write short %u/%u",
-             (unsigned)written, (unsigned)G_ENTRIES_BYTES);
+        LOGE("peer_keys: write short %u/%u", (unsigned)written, (unsigned)G_ENTRIES_BYTES);
     }
 }
 
@@ -76,38 +89,41 @@ static void persist_to_spiffs(void) {
 // 손상 감지: 파일 크기가 1 entry(74B)보다 작으면 corrupt로 간주
 //   → sizeof 버그로 4 bytes만 기록된 파일 등
 //   → false 반환 → peer_keys_init에서 NVS 마이그레이션 경로로 진입
-static bool load_from_spiffs(void) {
-    if (!SPIFFS.exists(BC_PEER_KEYS_FILE)) {
-        return false;
-    }
-    File f = SPIFFS.open(BC_PEER_KEYS_FILE, "r");
-    if (!f) {
-        LOGE("peer_keys: open(%s, r) failed", BC_PEER_KEYS_FILE);
-        return false;
-    }
-
-    // 파일 크기 검증: 최소 1 entry (74 bytes) 보다 작으면 corrupt
+// v44: 백업에서 로드 (.bin 손상 시 .bak에서 복구)
+static bool load_from_file(const char* path) {
+    if (!SPIFFS.exists(path)) return false;
+    File f = SPIFFS.open(path, "r");
+    if (!f) return false;
     size_t file_size = f.size();
     if (file_size < sizeof(peer_key_entry_t)) {
-        LOGW("peer_keys: file too small (%uB < %uB), treating as corrupt → try NVS migration",
-             (unsigned)file_size, (unsigned)sizeof(peer_key_entry_t));
         f.close();
-        // 손상된 파일 삭제 → 다음 부팅 시 NVS에서 정상 데이터 마이그레이션
-        SPIFFS.remove(BC_PEER_KEYS_FILE);
         return false;
     }
-
     size_t got = f.readBytes((char*)g_entries, G_ENTRIES_BYTES);
     f.close();
-    if (got != G_ENTRIES_BYTES) {
-        // 32-entry → 128-entry 업그레이드 시 발생 (정상 동작)
-        LOGW("peer_keys: file size %uB < expected %uB (likely 32-entry upgrade), padding zeros",
-             (unsigned)got, (unsigned)G_ENTRIES_BYTES);
-        if (got < G_ENTRIES_BYTES) {
-            memset((uint8_t*)g_entries + got, 0, G_ENTRIES_BYTES - got);
-        }
+    if (got < G_ENTRIES_BYTES) {
+        memset((uint8_t*)g_entries + got, 0, G_ENTRIES_BYTES - got);
     }
     return true;
+}
+
+static bool load_from_spiffs(void) {
+    // v44: 1차 — 원본 파일 로드 시도
+    if (load_from_file(BC_PEER_KEYS_FILE)) {
+        LOGI("peer_keys: loaded from %s", BC_PEER_KEYS_FILE);
+        return true;
+    }
+    // v44: 2차 — 백업 파일에서 복구
+    if (SPIFFS.exists(BC_PEER_KEYS_BAK_FILE)) {
+        LOGW("peer_keys: %s corrupt, restoring from %s", BC_PEER_KEYS_FILE, BC_PEER_KEYS_BAK_FILE);
+        if (load_from_file(BC_PEER_KEYS_BAK_FILE)) {
+            // 백업에서 복구 성공 → 원본 파일 재생성
+            persist_to_spiffs();
+            LOGI("peer_keys: restored from backup, primary file recreated");
+            return true;
+        }
+    }
+    return false;
 }
 
 // NVS에서 로드 (구버전 호환 - 마이그레이션 시 사용)
@@ -157,6 +173,16 @@ bool peer_keys_init(void) {
              (unsigned)G_ENTRIES_BYTES, BC_PEER_KEY_MAX_ENTRIES);
     }
 
+    // v43: LRU 추적 배열 동적 할당 + 초기화
+    if (!g_last_seen) {
+        g_last_seen = (uint32_t*)calloc(BC_PEER_KEY_MAX_ENTRIES, sizeof(uint32_t));
+    }
+
+    // v44: 뮤텍스 생성
+    if (!g_mutex) {
+        g_mutex = xSemaphoreCreateMutex();
+    }
+
     // SPIFFS 마운트는 main.cpp setup()에서 선행됨
     if (!SPIFFS.begin(true)) {
         LOGE("peer_keys: SPIFFS mount failed");
@@ -197,33 +223,82 @@ bool peer_keys_add_indexed(const uint8_t* sender_id, const uint8_t* pk, int key_
     if (!g_init) peer_keys_init();
     if (!sender_id || !pk || key_index < 0 || key_index > 1) return false;
 
+    // v44: 뮤텍스 보호 (BLE 콜백 동시성 방지)
+    if (g_mutex) xSemaphoreTake(g_mutex, portMAX_DELAY);
+
+    bool changed = false;
     // 기존 매핑 찾기
     for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
         if (g_entries[i].active &&
             memcmp(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE) == 0) {
-            // 이미 같은 키가 있으면 skip
             if (memcmp(g_entries[i].pk[key_index], pk, BC_PEER_KEY_PK_SIZE) == 0 &&
                 (g_entries[i].key_mask & (1 << key_index))) {
-                return true;  // 중복 add - 변경 없음, SPIFFS write 안 함 (wear 절약)
+                g_last_seen[i] = millis();  // 중복이어도 LRU 갱신
+                if (g_mutex) xSemaphoreGive(g_mutex);
+                return true;
             }
             memcpy(g_entries[i].pk[key_index], pk, BC_PEER_KEY_PK_SIZE);
             g_entries[i].key_mask |= (1 << key_index);
-            persist_to_spiffs();
-            return true;
+            g_last_seen[i] = millis();
+            changed = true;
+            break;
         }
     }
-    // 빈 슬롯
-    for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
-        if (!g_entries[i].active) {
-            g_entries[i].active = 1;
-            memcpy(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE);
-            memcpy(g_entries[i].pk[key_index], pk, BC_PEER_KEY_PK_SIZE);
-            g_entries[i].key_mask = (1 << key_index);
-            persist_to_spiffs();
-            return true;
+
+    if (!changed) {
+        // 빈 슬롯
+        for (int i = 0; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
+            if (!g_entries[i].active) {
+                g_entries[i].active = 1;
+                memcpy(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE);
+                memcpy(g_entries[i].pk[key_index], pk, BC_PEER_KEY_PK_SIZE);
+                g_entries[i].key_mask = (1 << key_index);
+                g_last_seen[i] = millis();
+                changed = true;
+                break;
+            }
         }
     }
-    return false;
+
+    if (!changed) {
+        // v43: LRU 교체
+        int oldest = 0;
+        uint32_t oldest_time = g_last_seen[0];
+        for (int i = 1; i < BC_PEER_KEY_MAX_ENTRIES; ++i) {
+            if (g_last_seen[i] < oldest_time) {
+                oldest_time = g_last_seen[i];
+                oldest = i;
+            }
+        }
+        LOGW("peer_keys: full (%d), evicting oldest slot %d",
+             BC_PEER_KEY_MAX_ENTRIES, oldest);
+        memset(&g_entries[oldest], 0, sizeof(peer_key_entry_t));
+        g_entries[oldest].active = 1;
+        memcpy(g_entries[oldest].sender_id, sender_id, BC_PEER_KEY_ID_SIZE);
+        memcpy(g_entries[oldest].pk[key_index], pk, BC_PEER_KEY_PK_SIZE);
+        g_entries[oldest].key_mask = (1 << key_index);
+        g_last_seen[oldest] = millis();
+        changed = true;
+    }
+
+    // v44: 지연 쓰기 — 즉시 persist하지 않고 dirty 플래그만 설정
+    if (changed) {
+        g_dirty = true;
+    }
+
+    if (g_mutex) xSemaphoreGive(g_mutex);
+    return changed;
+}
+
+// v44: 지연 쓰기 flush — main loop에서 주기적 호출
+void peer_keys_flush(void) {
+    if (!g_init || !g_dirty) return;
+    if (g_mutex) xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (g_dirty) {
+        persist_to_spiffs();
+        g_dirty = false;
+    }
+    if (g_mutex) xSemaphoreGive(g_mutex);
 }
 
 bool peer_keys_get_indexed(const uint8_t* sender_id, int key_index, uint8_t* out_pk) {
@@ -233,6 +308,7 @@ bool peer_keys_get_indexed(const uint8_t* sender_id, int key_index, uint8_t* out
             memcmp(g_entries[i].sender_id, sender_id, BC_PEER_KEY_ID_SIZE) == 0) {
             if (g_entries[i].key_mask & (1 << key_index)) {
                 memcpy(out_pk, g_entries[i].pk[key_index], BC_PEER_KEY_PK_SIZE);
+                g_last_seen[i] = millis();  // v43: LRU 갱신 (조회 시 접근 시간 기록)
                 return true;
             }
         }

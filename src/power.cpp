@@ -86,44 +86,32 @@ bool power_init(const power_config_t* cfg) {
     }
 
 #ifdef BC_POWER_IS_C3
-    // v31: C3의 유효 DFS 주파수는 80/160MHz만. 40MHz는 무효 → 0x0106 에러 원인.
-    // max=80, min=80 → CPU 항상 80MHz 고정 (DFS 효과 없지만 에러 없음)
-    // 발열은 f_cpu=80MHz + BLE 주기 느리게로 충분히 감소
+    // v42: C3 DFS 160→80 (유휴 시 80MHz, 바쁠 때 160MHz)
     esp_pm_config_esp32c3_t pm_cfg;
     memset(&pm_cfg, 0, sizeof(pm_cfg));
-    pm_cfg.max_freq_mhz       = 80;      // C3 최대 80MHz
-    pm_cfg.min_freq_mhz       = 80;      // v31: 40→80 (40MHz는 C3 무효 주파수)
-    pm_cfg.light_sleep_enable = false;   // light sleep 비활성 (BLE 비호환)
+    pm_cfg.max_freq_mhz       = 160;     // C3 최대 160MHz
+    pm_cfg.min_freq_mhz       = 80;      // 유휴 시 80MHz (DFS)
+    pm_cfg.light_sleep_enable = false;   // BLE 비호환
     esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(BC_POWER_IS_S3)
-    // v39d: S3에서 esp_pm_configure 완전 스킵 (0x0106 에러 + PM 서브시스템 불안정 근본 해결)
-    //   이전: max=min=160 설정해도 0x0106 반환 → PM 서브시스템이 불완전 상태
-    //   → cert gen 등 heavy operation에서 크래시 유발
-    //   해결: PM 호출 자체를 안 함 → CPU 부팅 주파수(160MHz) 고정, PM 서브시스템 건드리지 않음
-    LOGI("power: S3 PM skipped (fixed 160MHz, no DFS, most stable)");
-    esp_err_t rc = ESP_OK;  // 스킵 → 에러 없음
+    // v42: S3도 DFS 시도 (ECDSA 전환으로 안정화 예상)
+    esp_pm_config_esp32s3_t pm_cfg;
+    memset(&pm_cfg, 0, sizeof(pm_cfg));
+    pm_cfg.max_freq_mhz       = 160;
+    pm_cfg.min_freq_mhz       = 80;
+    pm_cfg.light_sleep_enable = false;
+    esp_err_t rc = esp_pm_configure(&pm_cfg);
 #elif defined(CONFIG_IDF_TARGET_ESP32S2)
     rc = ESP_OK;
 #else
-    esp_pm_config_esp32_t pm_cfg;
-    memset(&pm_cfg, 0, sizeof(pm_cfg));
-    pm_cfg.max_freq_mhz       = 240;     // ESP32 클래식 최대
-    pm_cfg.min_freq_mhz       = 80;
-    pm_cfg.light_sleep_enable = false;   // v29: light sleep 비활성 (BLE 호환성)
-    esp_err_t rc = esp_pm_configure(&pm_cfg);
+    // v42d: ESP32 클래식도 PM 스킵 (0x0106 제거, 240MHz 고정)
+    LOGI("power: ESP32 PM skipped (fixed 240MHz, no DFS)");
+    esp_err_t rc = ESP_OK;
 #endif
     if (rc != ESP_OK) {
         LOGW("esp_pm_configure failed: 0x%04x (continuing without DFS)", rc);
     } else {
-        LOGI("power: DFS configured (max=%d→min=%d MHz, light sleep off)",
-#ifdef BC_POWER_IS_C3
-             80, 40
-#elif defined(BC_POWER_IS_S3)
-             160, 80
-#else
-             240, 80
-#endif
-        );
+        LOGI("power: DFS active (160→80 MHz, light sleep off)");
     }
 
     // USB 상시 모드는 여기서 리턴 (배터리 전용 기능 스킵)
